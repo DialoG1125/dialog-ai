@@ -306,3 +306,39 @@ design-assets/
 *personal*
 *private*
 *confidential*
+
+
+# ===============================================
+# Python / FastAPI / 가상환경 관련
+# ===============================================
+
+# Python 가상환경 (절대 업로드 금지)
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+venv-old/
+*/venv/
+*/.venv/
+
+# Python 캐시 및 빌드 파일
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Pip / 패키지 관련
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook 체크포인트
+.ipynb_checkpoints
+
+# 환경 설정 파일 (이미 위에 있지만 혹시 몰라 명시)
+.env
+.env.*
