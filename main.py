@@ -1,25 +1,44 @@
 # -*- coding: utf-8 -*-
-"""CLOVA Speech API - FastAPI 서버 (실시간 STT + Object Storage + 비동기 발화자 분석)"""
+"""
+CLOVA Speech API + AI 요약/할일 + 챗봇 통합 FastAPI 서버 (DialoG)
+- 실시간 STT / 발화자 분석
+- AI 요약 / 할 일 생성
+- 회의록 검색 챗봇 / FAQ 챗봇
+"""
 
 import sys
 from pathlib import Path
+import os
+import asyncio
+import json
+import queue
+import uvicorn
 
-# ========== STT nest 모듈 경로 추가 ==========
+# ========== 경로 설정 (챗봇 및 STT 모듈 호환성) ==========
+# stt/nest 폴더 등을 모듈 경로로 인식시키기 위해 추가
 sys.path.insert(0, str(Path(__file__).parent / "stt" / "nest"))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import asyncio
-import json
-import queue
-import uvicorn
-import os
 
-# 내부 모듈
+# --- 내부 모듈: STT 관련 ---
 from stt.sttStreaming import ClovaSpeechRecognizer
 from stt.sttSpeaker import ClovaSpeakerAnalyzer, convert_language_code
 
+# --- 내부 모듈: AI 요약/할일 관련 ---
+from summary.summary_service import (
+    create_summary, 
+    SummaryRequest, 
+    SummaryResponse
+)
+from summary.action_service import (
+    generate_all_actions_service, 
+    ActionRequest, 
+    ActionResponse
+)
+
+# --- 내부 모듈: 챗봇 관련 ---
 # chatbotSearchMain에서 chat_endpoint 함수 import
 from chatbot.chatbotSearch.chatbotSearchMain import chat as chatbot_chat_endpoint
 from chatbot.chatbotSearch.models import ChatRequest, ChatResponse
@@ -27,10 +46,11 @@ from chatbot.chatbotSearch.models import ChatRequest, ChatResponse
 # chatbotFAQMain에서 FAQ chat_endpoint 함수 import  
 from chatbot.chatbotFAQ.chatbotFAQMain import chat as chatbot_faq_endpoint
 
+
 # ======================================================
 # FastAPI 기본 설정
 # ======================================================
-app = FastAPI(title="CLOVA Speech API (DialoG)", version="8.1")
+app = FastAPI(title="Dialog Integrated API Server", version="10.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,59 +62,93 @@ app.add_middleware(
 
 
 # ======================================================
-# 기본 정보
+# 1. 기본 정보 및 헬스 체크
 # ======================================================
 @app.get("/")
 async def root():
     """API 정보"""
     return {
-        "status": "CLOVA Speech API Server (DialoG)",
-        "version": "8.1",
-        "description": "실시간 STT + Object Storage + CLOVA ExternalURL 비동기 발화자 구분",
+        "status": "Dialog Integrated API Server Running",
+        "version": "10.0",
+        "description": "STT + Speaker Analysis + AI Summary/Actions + Chatbot",
         "endpoints": {
-            "websocket": "/ws/realtime",
-            "analyze_object": "/api/analyze/object",
-            "analyze_local": "/api/analyze",
-            "analyze_async": "/api/analyze/async",
-            "analyze_result": "/api/analyze/{token}",
-            "download_audio": "/api/download/audio",
+            "stt_websocket": "/ws/realtime",
+            "speaker_analyze": "/api/analyze/object",
+            "ai_summary": "/summary/generate",
+            "ai_actions": "/actions/generate",
+            "chatbot_search": "/api/chat",
+            "chatbot_faq": "/api/faq",
             "health": "/api/health"
-        },
-        "workflow": [
-            "1️⃣ 실시간 STT → ws://localhost:8000/ws/realtime",
-            "2️⃣ Object Storage 업로드 (자동)",
-            "3️⃣ 발화자 분석 요청 → POST /api/analyze/object",
-            "4️⃣ 비동기 결과 조회 → GET /api/analyze/{token}"
-        ]
+        }
     }
 
 
 @app.get("/api/health")
 async def health_check():
     """헬스 체크"""
-    return {"status": "healthy", "service": "CLOVA Speech API"}
+    return {"status": "healthy", "service": "Dialog API"}
 
 
+# ======================================================
+# 2. 챗봇 엔드포인트
+# ======================================================
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """회의록 검색 챗봇"""
-    result = await chatbot_chat_endpoint(request)
-    
-    # [수정] history 제거
-    result.history = None
-    
-    print(f"🔹 FastAPI 응답: {result.model_dump(exclude_none=True)}")
-    
-    return result
+    try:
+        result = await chatbot_chat_endpoint(request)
+        
+        # [옵션] 불필요한 history 데이터 제외 후 반환
+        result.history = None
+        
+        print(f"🔹 챗봇 응답 완료: {result.model_dump(exclude_none=True)}")
+        return result
+    except Exception as e:
+        print(f"❌ 챗봇 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/faq", response_model=ChatResponse)
 async def faq_endpoint(request: ChatRequest):
     """FAQ 챗봇 (IT 용어)"""
-    return await chatbot_faq_endpoint(request)
+    try:
+        return await chatbot_faq_endpoint(request)
+    except Exception as e:
+        print(f"❌ FAQ 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ======================================================
-# WebSocket: 실시간 STT
+# 3. AI 요약 및 할 일 생성 엔드포인트
+# ======================================================
+@app.post("/summary/generate", response_model=SummaryResponse)
+async def summarize_meeting(request: SummaryRequest):
+    """AI 요약 생성"""
+    try:
+        summary_data = await create_summary(request)
+        return SummaryResponse(success=True, summary=summary_data)
+    except Exception as e:
+        print(f"❌ 요약 생성 오류: {e}")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"요약 생성 실패: {str(e)}")
+
+
+@app.post("/actions/generate", response_model=ActionResponse)
+async def generate_all_actions(request: ActionRequest):
+    """AI 할 일 생성"""
+    try:
+        actions_list = await generate_all_actions_service(request)
+        return ActionResponse(success=True, actions=actions_list)
+    except Exception as e:
+        print(f"❌ 액션 아이템 생성 오류: {e}")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"액션 아이템 생성 실패: {str(e)}")
+
+
+# ======================================================
+# 4. 실시간 STT WebSocket
 # ======================================================
 @app.websocket("/ws/realtime")
 async def websocket_realtime_stt(websocket: WebSocket):
@@ -180,7 +234,6 @@ async def websocket_realtime_stt(websocket: WebSocket):
 
                 # STT 종료
                 elif msg_type == "done":
-                    # 업로드된 파일 URL 가져오기
                     file_url = recognizer.get_uploaded_file_url()
                     
                     await websocket.send_json({
@@ -208,7 +261,7 @@ async def websocket_realtime_stt(websocket: WebSocket):
                                 "type": "speaker_analysis_started",
                                 "token": analysis_result.get("token"),
                                 "file_url": file_url,
-                                "info": "발화자 분석 시작됨. /api/analyze/{token}으로 결과 조회 가능"
+                                "info": "발화자 분석 시작됨"
                             })
                         else:
                             await websocket.send_json({
@@ -241,18 +294,72 @@ async def websocket_realtime_stt(websocket: WebSocket):
 
 
 # ======================================================
-# REST API: 로컬 분석
+# 5. 발화자 분석 엔드포인트 (Object Storage & Local)
 # ======================================================
+@app.post("/api/analyze/object")
+async def analyze_from_object_storage(
+    file_url: str,
+    language: str = "ko",
+    speaker_min: int = -1,
+    speaker_max: int = -1,
+    callback_url: str = None
+):
+    """Object Storage URL 기반 비동기 발화자 분석"""
+    try:
+        print(f"\n🎧 CLOVA ExternalURL 분석 요청: {file_url}")
+        
+        analyzer = ClovaSpeakerAnalyzer()
+        lang = convert_language_code(language)
+
+        result = analyzer.analyze_audio_url_async(
+            file_url=file_url,
+            language=lang,
+            speaker_min=speaker_min,
+            speaker_max=speaker_max,
+            callback_url=callback_url
+        )
+
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        return {
+            "status": "started",
+            "token": result.get("token"),
+            "file_url": file_url,
+            "message": "CLOVA 비동기 분석 요청 성공"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analyze/{token}")
+async def get_async_result(token: str):
+    """비동기 발화자 분석 결과 조회"""
+    analyzer = ClovaSpeakerAnalyzer()
+    result = analyzer.get_async_result(token)
+    
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+    
+    # 완료 시 로그 출력
+    if result.get("status") == "COMPLETED":
+        print(f"\n🎉 분석 완료! (Token: {token})")
+        print(f"👥 화자 수: {result.get('totalSpeakers', 0)}명")
+
+    return result
+
+
 @app.post("/api/analyze")
 async def analyze_speaker_sync(
     language: str = "ko",
     speaker_min: int = -1,
     speaker_max: int = -1
 ):
-    """로컬 저장된 오디오 파일 발화자 구분 분석 (동기)"""
+    """로컬 파일 동기 분석"""
     path = "recordings/session_audio.wav"
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="로컬 오디오 파일을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="로컬 오디오 파일 없음")
 
     analyzer = ClovaSpeakerAnalyzer()
     result = analyzer.analyze_audio_file(
@@ -267,9 +374,6 @@ async def analyze_speaker_sync(
     return result
 
 
-# ======================================================
-# REST API: 비동기 로컬 분석
-# ======================================================
 @app.post("/api/analyze/async")
 async def analyze_speaker_async(
     language: str = "ko",
@@ -277,10 +381,10 @@ async def analyze_speaker_async(
     speaker_max: int = -1,
     callback_url: str = None
 ):
-    """로컬 오디오 파일 발화자 구분 분석 (비동기)"""
+    """로컬 파일 비동기 분석"""
     path = "recordings/session_audio.wav"
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="로컬 오디오 파일을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="로컬 오디오 파일 없음")
 
     analyzer = ClovaSpeakerAnalyzer()
     result = analyzer.analyze_audio_file_async(
@@ -297,119 +401,11 @@ async def analyze_speaker_async(
 
 
 # ======================================================
-# REST API: Object Storage URL 기반 분석
-# ======================================================
-@app.post("/api/analyze/object")
-async def analyze_from_object_storage(
-    file_url: str,
-    language: str = "ko",
-    speaker_min: int = -1,
-    speaker_max: int = -1,
-    callback_url: str = None
-):
-    """
-    Object Storage URL을 CLOVA ExternalURL API로 전달하여 비동기 발화자 구분 수행
-    """
-    try:
-        print("\n" + "=" * 80)
-        print("🎧 CLOVA ExternalURL 비동기 발화자 분석 요청 시작")
-        print(f"🔗 파일 URL: {file_url}")
-        print(f"🗣 언어 코드: {language}")
-        print(f"👥 화자 범위: {speaker_min} ~ {speaker_max}")
-        print("=" * 80)
-
-        analyzer = ClovaSpeakerAnalyzer()
-        lang = convert_language_code(language)
-
-        result = analyzer.analyze_audio_url_async(
-            file_url=file_url,
-            language=lang,
-            speaker_min=speaker_min,
-            speaker_max=speaker_max,
-            callback_url=callback_url
-        )
-
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
-
-        print(f"✅ CLOVA 비동기 요청 완료 → token: {result.get('token')}")
-        print("=" * 80 + "\n")
-
-        return {
-            "status": "started",
-            "token": result.get("token"),
-            "file_url": file_url,
-            "message": "CLOVA 비동기 분석 요청 성공"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ======================================================
-# REST API: 비동기 결과 조회
-# ======================================================
-@app.get("/api/analyze/{token}")
-async def get_async_result(token: str):
-    """CLOVA 비동기 발화자 분석 결과 조회"""
-    analyzer = ClovaSpeakerAnalyzer()
-    result = analyzer.get_async_result(token)
-    
-    if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
-    
-    # 결과가 완료되었을 때 터미널에 예쁘게 출력
-    if result.get("success") or result.get("status") == "COMPLETED":
-        print("\n" + "=" * 80)
-        print("🎉 CLOVA 발화자 분석 완료!")
-        print("=" * 80)
-        
-        # 전체 텍스트
-        if "text" in result:
-            print(f"\n📝 전체 텍스트:")
-            print(f"   {result['text'][:200]}{'...' if len(result['text']) > 200 else ''}")
-        
-        # 화자 정보
-        total_speakers = result.get("totalSpeakers", 0)
-        print(f"\n👥 총 화자 수: {total_speakers}명")
-        
-        # 화자별 통계
-        if "speakerStats" in result:
-            print(f"\n📊 화자별 통계:")
-            for label, info in result["speakerStats"].items():
-                name = info.get("name", f"화자{label}")
-                time_sec = info.get("time", 0) / 1000  # ms to sec
-                ratio = info.get("ratio", 0)
-                sentence_count = len(info.get("sentences", []))
-                print(f"   • {name}: {time_sec:.1f}초 ({ratio:.1f}%) - {sentence_count}개 문장")
-        
-        # 총 대화 시간
-        if "totalTalkTimeSec" in result:
-            total_time = result["totalTalkTimeSec"]
-            minutes = int(total_time // 60)
-            seconds = int(total_time % 60)
-            print(f"\n⏱️  총 대화 시간: {minutes}분 {seconds}초")
-        
-        # 문장 미리보기
-        if "segments" in result and len(result["segments"]) > 0:
-            print(f"\n💬 발화 미리보기 (처음 3개):")
-            for i, seg in enumerate(result["segments"][:3], 1):
-                speaker = seg.get("speaker", {}).get("name", "Unknown")
-                text = seg.get("text", "")
-                start = seg.get("start", 0) / 1000  # ms to sec
-                print(f"   {i}. [{start:.1f}초] {speaker}: {text[:80]}{'...' if len(text) > 80 else ''}")
-        
-        print("=" * 80 + "\n")
-    
-    return result
-
-
-# ======================================================
-# 오디오 파일 다운로드
+# 6. 유틸리티 (다운로드)
 # ======================================================
 @app.get("/api/download/audio")
 async def download_audio():
-    """녹음된 오디오 파일 다운로드 (테스트용)"""
+    """녹음된 오디오 파일 다운로드"""
     path = "recordings/session_audio.wav"
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="오디오 파일을 찾을 수 없습니다.")
@@ -421,15 +417,18 @@ async def download_audio():
 # ======================================================
 if __name__ == "__main__":
     print("\n" + "=" * 80)
-    print("🚀 Dialog AI Server 시작! (STT + 회의록 검색 + FAQ 통합)")
+    print("🚀 Dialog Integrated Server 시작! (STT + AI + Chatbot)")
     print("=" * 80)
-    print("📡 주요 엔드포인트:")
-    print("   • ws://localhost:8000/ws/realtime   → 실시간 STT")
-    print("   • POST /api/chat                    → 회의록 검색 챗봇")
-    print("   • POST /api/faq                     → FAQ 챗봇 (IT 용어)")
-    print("   • POST /api/analyze/object          → 발화자 분석")
-    print("   • GET  /api/analyze/{token}         → 비동기 결과 조회")
-    print("   • GET  /docs                        → API 문서")
+    print("📡 [STT & Analysis]")
+    print("   • ws://localhost:8000/ws/realtime            → 실시간 STT")
+    print("   • POST /api/analyze/object                   → 발화자 분석 (URL)")
+    print("   • GET  /api/analyze/{token}                  → 분석 결과 조회")
+    print("📡 [AI Generation]")
+    print("   • POST /summary/generate                     → AI 요약")
+    print("   • POST /actions/generate                     → AI 할 일")
+    print("📡 [Chatbot]")
+    print("   • POST /api/chat                             → 회의록 검색 챗봇")
+    print("   • POST /api/faq                              → FAQ 챗봇")
     print("=" * 80 + "\n")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

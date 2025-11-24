@@ -346,3 +346,6 @@ pip-delete-this-directory.txt
 # gRPC auto-generated files
 *_pb2.py
 *_pb2_grpc.py
+
+# nest
+stt/nest
