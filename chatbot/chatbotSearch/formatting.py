@@ -7,6 +7,20 @@
 from datetime import datetime
 import re
 
+def format_importance(level: str, reason: str = None) -> str:
+    """중요도 포맷팅"""
+    if not level:
+        return '정보 없음'
+    level_map = {
+        'HIGH': '🔴 높음',
+        'MEDIUM': '🟡 보통', 
+        'LOW': '🟢 낮음'
+    }
+    level_str = level_map.get(level, level)
+    if reason:
+        return f"{level_str} - {reason}"
+    return level_str
+
 # ============================================================
 # 기본 포맷팅
 # ============================================================
@@ -25,80 +39,133 @@ def format_single_meeting(meeting: dict) -> str:
     
     date_str = scheduled_at.strftime('%Y년 %m월 %d일') if scheduled_at else '날짜 정보 없음'
     
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
     return f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
-📝 설명: {meeting.get('description', '설명 없음')}
-💡 요약: {meeting.get('summary', '요약 없음')}"""
+👥 참가자: {participants_str}
+
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
+
+💡 요약:
+{meeting.get('summary') or '요약 없음'}"""
 
 
 def format_multiple_meetings_short(results: list, user_query: str, total: int = None, date_info: dict = None, status: str = None) -> str:
-    """여러 회의 간단 나열 (최대 5개, 설명 1-2줄)"""
+    """여러 회의를 상태별로 분리하여 간단히 포맷팅 (완료 3개 + 예정 3개)"""
+    from datetime import datetime
     
-    # 상태별 인사말 생성
-    if status == 'COMPLETED':
-        greeting = "네, 완료된 회의로는 다음과 같은 것들이 있어요! 📋\n\n"
-    elif status == 'SCHEDULED':
-        greeting = "네, 예정된 회의로는 다음과 같은 것들이 있어요! 📋\n\n"
-    elif status == 'RECORDING':
-        greeting = "네, 진행중인 회의로는 다음과 같은 것들이 있어요! 📋\n\n"
+    # ========== 상태별 분리 ==========
+    completed = [m for m in results if m.get('status') == 'COMPLETED']
+    scheduled = [m for m in results if m.get('status') == 'SCHEDULED']
+    
+    print(f"[DEBUG] 상태별 분리: 완료 {len(completed)}개, 예정 {len(scheduled)}개")
+    
+    # 조건 텍스트 생성
+    condition_text = ""
+    if date_info and date_info.get('original'):
+        condition_text = f"{date_info['original']} "
+    
+    response = f"네, {condition_text}회의로는 다음과 같은 것들이 있어요! 📋\n\n"
+    
+    idx = 1  # 연속 번호 시작
+    
+    # ========== 완료와 예정 개수 결정 ==========
+    if len(completed) > 0 and len(scheduled) > 0:
+        # 둘 다 있으면: 완료 3개 + 예정 3개
+        completed_limit = 3
+        scheduled_limit = 3
+    elif len(completed) > 0:
+        # 완료만 있으면: 완료 5개
+        completed_limit = 5
+        scheduled_limit = 0
     else:
-        # 상태 필터 없음 (전체 검색)
-        if date_info and date_info.get('original'):
-            # 날짜 조건만 있는 경우
-            greeting = f"네, {date_info['original']} 회의로는 다음과 같은 것들이 있어요! 📋\n\n"
-        else:
-            # 아무 조건 없음
-            greeting = "회의 목록이에요! 📋\n\n"
-    
-    response = greeting
-    
-    display_limit = 5  # 5개로 제한
+        # 예정만 있으면: 예정 5개
+        completed_limit = 0
+        scheduled_limit = 5
 
-    for i, meeting in enumerate(results):
-        if i >= display_limit:
-            break
+    # ========== 완료된 회의 ==========
+    if completed:
+        response += "✅ 완료된 회의:\n\n"
+        for i, meeting in enumerate(completed[:completed_limit], 1):
+            scheduled_at = meeting.get('scheduled_at')
+            if isinstance(scheduled_at, str):
+                scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+            date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+            
+            title = meeting.get('title', '제목 없음')
+            
+            summary = meeting.get('summary') or ''
+            if not summary.strip():
+                summary = meeting.get('description') or '내용 없음'
+                
+            lines = summary.split('.')[:2]
+            display_text = '. '.join([line.strip() for line in lines if line.strip()])
+            
+            response += f"📌{i}. {title} {date_str}\n"
+            response += f"   - {display_text}\n\n"
         
-        emoji = f"{i+1}."
-        title = meeting.get('title', '제목 없음')
-        
-        # 날짜 포맷
-        scheduled_at = meeting.get('scheduled_at')
-        if isinstance(scheduled_at, str):
-            scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
-        date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
-        
-        # ========== summary 없거나 짧으면 description 사용 ==========
-        summary = meeting.get('summary', '')
-        if not summary or summary.strip() == '':
-            summary = meeting.get('description', '내용 없음')
-        
-        # summary가 너무 짧으면 (50자 미만) description도 추가
-        if len(summary) < 50:
-            desc = meeting.get('description', '')
-            if desc and len(desc) > len(summary):
-                summary = desc
-        
-        # 2문장 전체 표시 (자르지 않음)
-        lines = summary.split('.')[:2]  # 문장 2개
-        display_text = '. '.join([line.strip() for line in lines if line.strip()])
-        if display_text and not display_text.endswith('.'):
-            display_text += '.'  # 마침표 추가
-                        
-        response += f"📌 {emoji} {title} {date_str}\n"
-        response += f"   - {display_text}\n\n"
-    
-    # 나머지 개수 표시 + 검색 팁
-    displayed_count = min(len(results), display_limit)  # 실제로 표시한 개수
-    remaining = total - displayed_count if total else len(results) - displayed_count
+        # 완료된 회의 나머지 개수
+        remaining_completed = len(completed) - completed_limit
+        if remaining_completed > 0:
+            response += f"💡 완료된 회의가 {remaining_completed}개 더 있어요!\n\n"
 
-    if remaining > 0:
-        response += f"💡 이 외에도 {remaining}개의 회의가 더 있어요!\n"
+    # ========== 예정된 회의 ==========
+    if scheduled:
+        response += "📅 예정된 회의:\n\n"
+        for i, meeting in enumerate(scheduled[:scheduled_limit], 1):
+            scheduled_at = meeting.get('scheduled_at')
+            if isinstance(scheduled_at, str):
+                scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+            date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+            
+            # 날짜 지남 체크
+            is_past = False
+            if scheduled_at and scheduled_at.date() < datetime.now().date():
+                is_past = True
+                date_str = date_str.replace(')', ' - 일정 지남)')
+            
+            title = meeting.get('title', '제목 없음')
+            
+            summary = meeting.get('summary') or ''
+            if not summary.strip():
+                summary = meeting.get('description') or '내용 없음'
+
+            lines = summary.split('.')[:2]
+            display_text = '. '.join([line.strip() for line in lines if line.strip()])
+            
+            emoji = '⚠️' if is_past else '📌'
+            response += f"{emoji}{i}. {title} {date_str}\n"
+            response += f"   - {display_text}\n\n"
+        
+        # 예정된 회의 나머지 개수
+        remaining_scheduled = len(scheduled) - scheduled_limit
+        if remaining_scheduled > 0:
+            response += f"💡 예정된 회의가 {remaining_scheduled}개 더 있어요!\n\n"
+            
+    # ========== 마지막 안내 ==========
+    # 나머지가 실제로 있을 때만 "나머지 보여줘" 멘트 표시
+    remaining_completed = len(completed) - completed_limit
+    remaining_scheduled = len(scheduled) - scheduled_limit
+
+    if remaining_completed > 0 or remaining_scheduled > 0:
         response += "💬 \"나머지 보여줘\" 라고 하시면 계속 볼 수 있어요!\n\n"
-    
+
     response += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
-    response += "예: 번호(1, 2), 날짜(10월 20일), 제목(디자인 회의) 😊"
-    
-    return response
+    response += "예: 번호(완료 1, 예정 2), 제목(디자인 회의) 😊"
+
+    return response, completed_limit, scheduled_limit
 
 # ============================================================
 # Phase 2-A: 페르소나 템플릿 (5개 직업군만)
@@ -200,7 +267,7 @@ def extract_security_tech_stack(meeting: dict) -> list:
 
 def extract_simple_info(meeting: dict, keywords: list) -> str:
     """간단한 정보 추출"""
-    description = meeting.get('description', '')
+    description = meeting.get('description') or ''
     lines = description.split('\n')
     
     results = []
@@ -211,7 +278,6 @@ def extract_simple_info(meeting: dict, keywords: list) -> str:
     return '\n'.join(results) if results else '   없음'
 
 # ============================================================
-
 def format_project_manager_meeting(meeting: dict) -> str:
     """PROJECT_MANAGER용 회의 템플릿"""
     scheduled_at = meeting.get('scheduled_at', '')
@@ -224,22 +290,34 @@ def format_project_manager_meeting(meeting: dict) -> str:
     except:
         date_str = str(scheduled_at)[:10] if scheduled_at else '날짜 없음'
     
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
     summary = meeting.get('summary', '')
     goal = summary.split('.')[0].strip() if summary else '없음'
     
-    tech_stack = extract_pm_tech_stack(meeting)  # ← 추가!
+    tech_stack = extract_pm_tech_stack(meeting)
     planning_info = extract_simple_info(meeting, ['기획', '전략', '로드맵', '목표', '계획', '일정', '마일스톤'])
     
     template = f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
-🎯 회의 목표: {goal}
+👥 참가자: {participants_str}
 📊 사용 도구: {', '.join(tech_stack) if tech_stack else '정보 없음'}
 
-📝 논의사항:
-{meeting.get('description', '없음')}
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
 
 💡 요약:
-{meeting.get('summary', '없음')}
+{meeting.get('summary') or '없음'}
 
 📊 PM 주요사항:
 {planning_info}
@@ -247,7 +325,6 @@ def format_project_manager_meeting(meeting: dict) -> str:
     return template
 
 # ============================================================
-
 def format_frontend_developer_meeting(meeting: dict) -> str:
     """FRONTEND_DEVELOPER용 회의 템플릿"""
     scheduled_at = meeting.get('scheduled_at', '')
@@ -260,18 +337,31 @@ def format_frontend_developer_meeting(meeting: dict) -> str:
     except:
         date_str = str(scheduled_at)[:10] if scheduled_at else '날짜 없음'
     
-    tech_stack = extract_frontend_tech_stack(meeting)  # ← 추가!
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
+    tech_stack = extract_frontend_tech_stack(meeting)
     ui_info = extract_simple_info(meeting, ['ui', 'ux', '화면', '컴포넌트', 'react', 'vue', 'frontend', '프론트'])
     
     template = f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
+👥 참가자: {participants_str}
 💻 기술 스택: {', '.join(tech_stack) if tech_stack else '정보 없음'}
 
-📝 논의사항:
-{meeting.get('description', '없음')}
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
 
 💡 요약:
-{meeting.get('summary', '없음')}
+{meeting.get('summary') or '없음'}
 
 🎨 UI/UX 작업사항:
 {ui_info}
@@ -279,10 +369,9 @@ def format_frontend_developer_meeting(meeting: dict) -> str:
     return template
 
 # ============================================================
-
 def format_backend_developer_meeting(meeting: dict) -> str:
     """BACKEND_DEVELOPER용 회의 템플릿"""
-    tech_stack = extract_backend_tech_stack(meeting)  # ← 변경! (더 구체적인 함수)
+    tech_stack = extract_backend_tech_stack(meeting)
     
     scheduled_at = meeting.get('scheduled_at', '')
     try:
@@ -294,17 +383,30 @@ def format_backend_developer_meeting(meeting: dict) -> str:
     except:
         date_str = str(scheduled_at)[:10] if scheduled_at else '날짜 없음'
     
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
     backend_tasks = extract_simple_info(meeting, ['api', '서버', '백엔드', 'backend', '데이터베이스', '배포'])
     
     template = f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
+👥 참가자: {participants_str}
 💻 기술 스택: {', '.join(tech_stack) if tech_stack else '정보 없음'}
 
-📝 논의사항:
-{meeting.get('description', '없음')}
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
 
 💡 요약:
-{meeting.get('summary', '없음')}
+{meeting.get('summary') or '없음'}
 
 🔧 백엔드 작업사항:
 {backend_tasks}
@@ -312,7 +414,6 @@ def format_backend_developer_meeting(meeting: dict) -> str:
     return template
 
 # ============================================================
-
 def format_database_administrator_meeting(meeting: dict) -> str:
     """DATABASE_ADMINISTRATOR용 회의 템플릿"""
     scheduled_at = meeting.get('scheduled_at', '')
@@ -325,18 +426,31 @@ def format_database_administrator_meeting(meeting: dict) -> str:
     except:
         date_str = str(scheduled_at)[:10] if scheduled_at else '날짜 없음'
     
-    tech_stack = extract_dba_tech_stack(meeting)  # ← 추가!
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
+    tech_stack = extract_dba_tech_stack(meeting)
     db_tasks = extract_simple_info(meeting, ['데이터베이스', 'database', 'db', 'sql', '쿼리', '최적화', '인덱스', 'mysql'])
     
     template = f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
+👥 참가자: {participants_str}
 🗄️ DB 기술: {', '.join(tech_stack) if tech_stack else '정보 없음'}
 
-📝 논의사항:
-{meeting.get('description', '없음')}
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
 
 💡 요약:
-{meeting.get('summary', '없음')}
+{meeting.get('summary') or '없음'}
 
 💾 데이터베이스 작업사항:
 {db_tasks}
@@ -344,7 +458,6 @@ def format_database_administrator_meeting(meeting: dict) -> str:
     return template
 
 # ============================================================
-
 def format_security_developer_meeting(meeting: dict) -> str:
     """SECURITY_DEVELOPER용 회의 템플릿"""
     scheduled_at = meeting.get('scheduled_at', '')
@@ -357,18 +470,31 @@ def format_security_developer_meeting(meeting: dict) -> str:
     except:
         date_str = str(scheduled_at)[:10] if scheduled_at else '날짜 없음'
     
+    # 추가 정보 추출
+    participants = meeting.get('participants', [])
+    participants_str = ', '.join(participants) if participants else '정보 없음'
+    purpose = meeting.get('purpose') or '정보 없음'
+    agenda = meeting.get('agenda') or '정보 없음'
+    importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
+    
     tech_stack = extract_security_tech_stack(meeting)
     security_tasks = extract_simple_info(meeting, ['보안', 'security', '취약점', '암호화', '인증', '권한'])
     
     template = f"""📌 {meeting.get('title', '제목 없음')}
 📅 날짜: {date_str}
+👥 참가자: {participants_str}
 🔒 보안 도구: {', '.join(tech_stack) if tech_stack else '정보 없음'}
 
-📝 논의사항:
-{meeting.get('description', '없음')}
+🎯 회의 목적:
+{purpose}
+
+📋 안건:
+{agenda}
+
+⭐ 중요도: {importance_str}
 
 💡 요약:
-{meeting.get('summary', '없음')}
+{meeting.get('summary') or '없음'}
 
 🛡️ 보안 작업사항:
 {security_tasks}
@@ -661,3 +787,57 @@ def format_person_meetings(user: dict, meetings: list) -> str:
         message += "\n\n번호를 말씀해주시면 자세히 알려드릴게요! 😊"
         
         return message.strip()
+    
+def calculate_shown_counts(meetings: list) -> tuple:
+    """
+    회의 목록에서 실제 보여줄 개수 계산
+    
+    Returns:
+        (shown_completed, shown_scheduled)
+    """
+    completed = [m for m in meetings if m.get('status') == 'COMPLETED']
+    scheduled = [m for m in meetings if m.get('status') == 'SCHEDULED']
+    
+    # format_multiple_meetings_short와 동일한 로직
+    if len(completed) > 0 and len(scheduled) > 0:
+        # 둘 다 있으면: 완료 3개 + 예정 3개
+        return min(3, len(completed)), min(3, len(scheduled))
+    elif len(completed) > 0:
+        # 완료만 있으면: 완료 5개
+        return min(5, len(completed)), 0
+    else:
+        # 예정만 있으면: 예정 5개
+        return 0, min(5, len(scheduled))
+    
+
+def format_meeting_tasks(tasks: list, meeting_title: str = None) -> str:
+    """특정 회의의 Task 포맷팅 (전체 할일)"""
+    
+    if not tasks or len(tasks) == 0:
+        if meeting_title:
+            return f"📌 {meeting_title}에서 정한 할 일이 없어요! 😊"
+        return "📌 이 회의에서 정한 할 일이 없어요! 😊"
+    
+    title_text = f"📌 {meeting_title}의 할 일" if meeting_title else "📌 할 일 목록"
+    answer = f"{title_text} ({len(tasks)}개)\n\n"
+    
+    for i, task in enumerate(tasks, 1):
+        status_emoji = "✅" if task.get('status') == 'COMPLETED' else "⏳"
+        title = task.get('title', '제목 없음')
+        assignee = task.get('assignee_name') or task.get('assignee_real_name', '미정')
+        due_date = task.get('due_date')
+        
+        answer += f"{status_emoji} {i}. {title}\n"
+        answer += f"   담당자: {assignee}\n"
+        
+        if due_date:
+            if hasattr(due_date, 'strftime'):
+                answer += f"   마감일: {due_date.strftime('%m월 %d일')}\n"
+            else:
+                answer += f"   마감일: {due_date}\n"
+        else:
+            answer += f"   마감일: 미정\n"
+        
+        answer += "\n"
+    
+    return answer.strip()

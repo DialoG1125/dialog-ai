@@ -49,8 +49,7 @@ def get_db_connection():
 def init_db_connection():
     """실제 DB 연결 생성 (컨텍스트 저장용)"""
     try:
-        import mysql.connector
-        connection = mysql.connector.connect(
+        connection = pymysql.connect(
             host=DB_HOST,
             port=DB_PORT,
             user=DB_USER,

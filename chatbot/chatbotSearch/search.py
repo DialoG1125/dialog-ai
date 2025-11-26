@@ -9,7 +9,6 @@
 """
 import re
 import logging
-import mysql.connector
 from datetime import datetime, timedelta
 from .database import get_db_connection
 from .config import ENABLE_PERSONA
@@ -180,7 +179,7 @@ def parse_date_from_query(query: str) -> dict:
         result['start_date'] = last_week.replace(hour=0, minute=0, second=0)
         result['end_date'] = today.replace(hour=23, minute=59, second=59)
         result['original'] = '최근'
-        result['recent_flag'] = True  # ← 최근 플래그 추가!
+        result['recent_flag'] = True
         return result
     
     # ========== 2. 절대적 날짜 ==========
@@ -404,11 +403,17 @@ def extract_keywords_from_query(utterance):
     # 1. 한글 2글자 이상 추출
     tokens = re.findall(r'[가-힣]{2,}', utterance)
     
-    # 2. 영문/숫자 키워드 추출 (AI, Q4, CEO 등)
+    # 2. 영문/숫자 키워드 추출 (AI, Q4, CEO 등) - 날짜 숫자 제외!
     english_tokens = re.findall(r'[A-Za-z0-9]+', utterance)
     
-    # 영문 키워드 중 의미있는 것만 (2글자 이상 또는 대문자)
     for token in english_tokens:
+        # 숫자인 경우 날짜 패턴 체크 (앞뒤에 월/일/년이 있으면 스킵)
+        if token.isdigit():
+            if re.search(rf'{token}\s*[월일년]', utterance):
+                print(f"[DEBUG] 날짜 숫자 스킵: '{token}'")
+                continue
+        
+        # 영문 키워드 중 의미있는 것만 (2글자 이상 또는 대문자)
         if len(token) >= 2:
             tokens.append(token.upper())  # 대문자로 통일
         elif token.isupper():  # 1글자여도 대문자면 약어로 간주
@@ -417,14 +422,12 @@ def extract_keywords_from_query(utterance):
     # ========== 복합어 전처리 (회의, 관련 분리) ==========
     processed_tokens = []
     for token in tokens:
-        # '회의'로 끝나는 복합어 처리
         if token.endswith('회의') and len(token) > 2:
-            base_word = token[:-2]  # '개발회의' → '개발'
+            base_word = token[:-2]
             processed_tokens.append(base_word)
             print(f"[DEBUG] 복합어 분리: '{token}' → '{base_word}'")
-        # '관련'으로 끝나는 복합어 처리
         elif token.endswith('관련') and len(token) > 2:
-            base_word = token[:-2]  # '채용관련' → '채용'
+            base_word = token[:-2]
             processed_tokens.append(base_word)
             print(f"[DEBUG] 복합어 분리: '{token}' → '{base_word}'")
         else:
@@ -432,8 +435,6 @@ def extract_keywords_from_query(utterance):
     
     tokens = processed_tokens
     
-    keywords = []
-
     # 의미 없는 패턴 (완전판!)
     meaningless_patterns = [
         # ========== 날짜/시간 표현 ==========
@@ -531,44 +532,7 @@ def extract_keywords_from_query(utterance):
     
     # 중복 제거
     keywords = list(dict.fromkeys(keywords))
-    
-    # ========== 날짜 관련 숫자 제거 ==========
-    # 1. 날짜 패턴과 함께 나온 숫자 제거
-    date_number_patterns = [
-        r'(\d{1,2})\s*월',      # 11월, 1월
-        r'(\d{1,2})\s*일',      # 15일, 1일  
-        r'(\d{4})\s*년',        # 2025년
-        r'월\s*(\d{1,2})',      # 월 11
-        r'일\s*(\d{1,2})',      # 일 15
-    ]
-    
-    excluded_numbers = set()
-    for pattern in date_number_patterns:
-        matches = re.findall(pattern, utterance)
-        for match in matches:
-            excluded_numbers.add(match)
-    
-    # 2. 날짜 관련 단어 근처의 모든 숫자 제거
-    date_words = ['월', '일', '년', '부터', '까지', '전', '후', '오늘', '어제', '내일', '이번주', '지난주', '다음주']
-    has_date_context = any(word in utterance for word in date_words)
-    
-    if has_date_context:
-        # 날짜 맥락이 있으면 1~4자리 숫자는 모두 제거 (년도 포함)
-        original_keywords = keywords.copy()
-        keywords = [kw for kw in keywords if not (kw.isdigit() and 1 <= len(kw) <= 4)]
-        removed = set(original_keywords) - set(keywords)
-        if removed:
-            print(f"[DEBUG] 날짜 맥락에서 숫자 제거: {removed}")
 
-    else:
-        # 날짜 맥락 없으면 패턴 매칭된 것만 제거
-        if excluded_numbers:
-            original_keywords = keywords.copy()
-            keywords = [kw for kw in keywords if kw not in excluded_numbers]
-            removed = set(original_keywords) - set(keywords)
-            if removed:
-                print(f"[DEBUG] 날짜 숫자 제거: {removed}")
-    
     return keywords
 
 # ============================================================
@@ -629,6 +593,34 @@ def parse_meetings_list(lambda_response: str) -> list:
     logger.info(f"[파싱 완료] {len(meetings)}개 회의 발견")
     return meetings
 
+# ============================================================
+# 페이지네이션 체크
+# ============================================================
+
+def is_pagination_request(query: str) -> bool:
+    """페이지네이션 요청 여부 확인"""
+    pagination_keywords = ['나머지', '나머지도', '남은', '남은거', '더', '더보기', '더보여',
+                          '더있어', '더줘', '더알려', '추가', '추가로', '계속', '이어서',
+                          '다음', '다른', '또', '그외', '외', '그밖', '더있나', '더있니',
+                          '또뭐', '또있어', '나머', '남머', '나미', '더보',
+                          '줘봐', '줘', '보여줘', '보여', '알려줘', '알려']
+    
+    pagination_patterns = [
+        r'나머.*',
+        r'남은.*',
+        r'더.*[보줘있알려]',
+        r'추가.*',
+        r'계속|이어서|다음',
+        r'또.*[있뭐어]',
+        r'그\s*외',
+        r'더\s*[보줘]',
+        r'줘\s*봐',
+        r'보여\s*줘',
+        r'알려\s*줘'
+    ]
+    
+    return (any(kw in query for kw in pagination_keywords) or
+            any(re.search(pattern, query) for pattern in pagination_patterns))
 
 # ============================================================
 # 오프토픽 체크
@@ -637,7 +629,7 @@ def parse_meetings_list(lambda_response: str) -> list:
 def is_off_topic_query(query: str) -> bool:
     """회의록과 무관한 질문인지 체크"""
     query_lower = query.lower().strip()
-    
+
     # ========== 1. 회의 관련 핵심 키워드 있으면 무조건 통과 ==========
     meeting_keywords = [
         '회의', '미팅', 'meeting', '회의록', '논의', '안건',
@@ -707,14 +699,209 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
     from .config import ENABLE_PERSONA
     from .llm import parse_query_intent
     
+    # ========== user_id → user_name 변환 ==========
+    user_name = None
+    if user_id:
+        from .database import get_db_connection
+        with get_db_connection() as conn:
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM user WHERE id = %s", (user_id,))
+                result = cursor.fetchone()
+                if result:
+                    user_name = result['name']
+                    print(f"[DEBUG] user_id={user_id} → user_name={user_name}")
+                cursor.close()
+    
     with get_db_connection() as conn:
         if not conn:
             return ("데이터베이스 연결 실패", [])
         
         try:
+            # ========== 회의 목록 요청 패턴 감지 (최우선!) ==========
+            list_patterns = ['뭐', '목록', '리스트', '전체', '모든', '다', '보여', '알려', '있어', '있나', '있니']
+            query_lower = user_query.lower()
+
+            # "회의" + 목록 패턴 OR 날짜만 있고 키워드 없음
+            has_meeting_word = any(word in query_lower for word in ['회의', '미팅'])
+            has_list_pattern = any(pattern in query_lower for pattern in list_patterns)
+            is_short_query = len(user_query) <= 20
+
+            if has_meeting_word and has_list_pattern and is_short_query:
+                print(f"[DEBUG] 회의 목록 요청 감지!")
+                
+                # 키워드 추출 (회의 목록 요청에서도 키워드 필터 적용)
+                list_keywords = extract_keywords_from_query(user_query)
+                print(f"[DEBUG] 회의 목록 키워드: {list_keywords}")
+                
+                cursor = conn.cursor()
+                
+                if user_name:
+                    query = """
+                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                        FROM meeting m 
+                        LEFT JOIN meeting_result mr ON m.id = mr.meeting_id 
+                        INNER JOIN participant p ON m.id = p.meeting_id
+                        WHERE p.name = %s
+                    """
+                    params = [user_name]
+
+                # 키워드 필터 추가!
+                if list_keywords:
+                    keyword_conditions = []
+                    for kw in list_keywords:
+                        keyword_conditions.append("(m.title LIKE %s OR m.description LIKE %s OR mr.summary LIKE %s)")
+                        params.extend([f'%{kw}%', f'%{kw}%', f'%{kw}%'])
+                    query += " AND (" + " OR ".join(keyword_conditions) + ")"
+                    print(f"[DEBUG] 키워드 필터 추가: {list_keywords}")
+
+                if date_info.get('start_date'):
+                    query += " AND m.scheduled_at >= %s"
+                    params.append(date_info['start_date'])
+
+                if date_info.get('end_date'):
+                    query += " AND m.scheduled_at <= %s"
+                    params.append(date_info['end_date'])
+
+                # status 조건 추가
+                if status:
+                    query += " AND m.status = %s"
+                    params.append(status)
+                    print(f"[DEBUG] 상태 필터 추가: {status}")
+
+                query += " GROUP BY m.id ORDER BY m.scheduled_at DESC LIMIT 20"
+
+                print(f"[DEBUG] 회의 목록 SQL: {query}")
+                print(f"[DEBUG] 회의 목록 Params: {params}")
+                print(f"[DEBUG] date_info: {date_info}")
+                print(f"[DEBUG] user_id: {user_id}")
+                
+                cursor.execute(query, params)
+                meetings = cursor.fetchall()
+                
+                # 참가자 조회 추가
+                for meeting in meetings:
+                    cursor.execute("SELECT name FROM participant WHERE meeting_id = %s", (meeting['id'],))
+                    participants = cursor.fetchall()
+                    meeting['participants'] = [p['name'] for p in participants]
+                
+                print(f"[DEBUG] 회의 목록 검색 결과: {len(meetings)}개")
+                if meetings:
+                    print(f"[DEBUG] 첫 번째 회의: {meetings[0].get('title', 'N/A')}")
+                     
+                if not meetings:
+                    if date_info and date_info.get('original'):  # 날짜 정보 있으면
+                        date_str = date_info['original']
+                        return (f"❌ {date_str}에 회의가 없어요.", [])
+                    else:
+                        return ("아직 회의가 없어요! 😊", [])
+                
+                # 페르소나 정렬
+                if ENABLE_PERSONA and user_job and len(meetings) > 1:
+                    meetings = search_with_persona(meetings, user_job)
+                    print(f"[DEBUG] 회의 목록 페르소나 정렬 완료")
+
+                # 단일 회의면 상세 정보 바로 표시
+                if len(meetings) == 1:
+                    if ENABLE_PERSONA and user_job:
+                        meeting_detail = format_single_meeting_with_persona(meetings[0], user_job)
+                    else:
+                        meeting_detail = format_single_meeting(meetings[0])
+                    print(f"[DEBUG] 단일 회의 → 상세 정보 표시")
+                    return (meeting_detail, meetings)
+
+                # 결과 포맷팅 (여러 회의)
+                message, _, _  = format_multiple_meetings_short(
+                    meetings[:10],
+                    user_query,
+                    len(meetings) if len(meetings) > 10 else None,
+                    date_info,
+                    None
+                )
+
+                return (message, meetings)
+            
+            # ========== 기존 키워드 검색 로직 ==========
             # 1. 키워드 추출
             keywords = extract_keywords_from_query(user_query)
             print(f"[DEBUG] 추출된 키워드: {keywords}")
+
+            # 오프토픽 체크 전에 추가
+            if not keywords and not status and date_info:
+                print(f"[DEBUG] 날짜만 있음 → 회의 목록 요청으로 처리")
+                
+                cursor = conn.cursor()
+                
+                if user_name:
+                    query = """
+                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                        FROM meeting m 
+                        LEFT JOIN meeting_result mr ON m.id = mr.meeting_id 
+                        INNER JOIN participant p ON m.id = p.meeting_id
+                        WHERE p.name = %s
+                    """
+                    params = [user_name]
+                
+                if date_info and date_info.get('start_date'):
+                    query += " AND scheduled_at >= %s"
+                    params.append(date_info['start_date'])
+                    print(f"[DEBUG] start_date: {date_info['start_date']}")
+
+                if date_info.get('end_date'):
+                    query += " AND scheduled_at <= %s"
+                    params.append(date_info['end_date'])
+                    print(f"[DEBUG] end_date: {date_info['end_date']}")
+
+                
+                query += " GROUP BY m.id ORDER BY scheduled_at DESC LIMIT 20"
+                
+                print(f"[DEBUG] 날짜만 있음 SQL: {query}")
+                print(f"[DEBUG] 날짜만 있음 Params: {params}")
+                
+                # 실제 실행되는 쿼리 출력!
+                try:
+                    final_query = query
+                    for param in params:
+                        final_query = final_query.replace('%s', f"'{param}'", 1)
+                    print(f"[DEBUG] 최종 쿼리: {final_query}")
+                except:
+                    pass
+                
+                # ========== 디버깅 추가 ==========
+                print(f"[DEBUG] 쿼리 실행 직전:")
+                print(f"  - query: {query}")
+                print(f"  - params: {params}")
+
+                cursor.execute(query, params)
+                raw_result = cursor.fetchall()
+
+                print(f"[DEBUG] fetchall() 직후:")
+                print(f"  - type: {type(raw_result)}")
+                print(f"  - len: {len(raw_result) if raw_result else 0}")
+                if raw_result:
+                    print(f"  - first item: {raw_result[0]}")
+
+                meetings = raw_result
+                print(f"[DEBUG] 날짜만 있음 검색 결과: {len(meetings)}개")
+
+                # 에러 체크!
+                if len(meetings) == 0:
+                    # 직접 쿼리로 확인
+                    test_query = f"SELECT COUNT(*) as cnt FROM meeting WHERE host_user_id = 1 AND scheduled_at >= '2025-10-01 00:00:00' AND scheduled_at <= '2025-10-31 23:59:59'"
+                    cursor.execute(test_query)
+                    test_result = cursor.fetchone()
+                    print(f"[DEBUG] 테스트 쿼리 결과: {test_result}")
+                            
+                if not meetings:
+                    date_str = date_info.get('original', '해당 기간')
+                    return (f"❌ {date_str}에 회의가 없어요.", [])
+                
+                # 페르소나 정렬
+                if ENABLE_PERSONA and user_job and len(meetings) > 1:
+                    meetings = search_with_persona(meetings, user_job)
+                
+                message, _, _  = format_multiple_meetings_short(meetings[:10], user_query, len(meetings) if len(meetings) > 10 else None, date_info, None)
+                return (message, meetings)
             
             # ========== Hybrid 방식: 패턴 실패 시 LLM 호출 ==========
             # 통계 질문 감지
@@ -739,7 +926,8 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                             keywords=keywords or parsed.get('keywords', []),
                             date_info=date_info,
                             status=status or parsed.get('status'),
-                            user_job=user_job
+                            user_job=user_job,
+                            user_name=user_name
                         )
                         if result:
                             return format_count_result(result, user_query)
@@ -767,30 +955,36 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
             # 2. SQL 쿼리 구성
             cursor = conn.cursor()
                         
-            query = "SELECT * FROM Meeting WHERE 1=1"
+            query = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                FROM meeting m
+                LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                INNER JOIN participant p ON m.id = p.meeting_id
+                WHERE 1=1"""
             params = []
 
-            # [추가] user_id 조건 (로그인한 사용자의 회의만)
-            if user_id:
-                query += " AND host_user_id = %s"
-                params.append(user_id)
-                print(f"[DEBUG] user_id 필터 추가: {user_id}")
+            # [추가] user_name 조건 (로그인한 사용자가 참석한 회의만)
+            if user_name:
+                query += " AND p.name = %s"
+                params.append(user_name)
+                print(f"[DEBUG] user_name 필터 추가: {user_name}")
             
-            # 키워드 조건 (SQL에서 직접 처리)
+            # 키워드 조건 (날짜 파싱 성공 시 제외)
             if keywords:
                 keyword_conditions = []
                 for keyword in keywords:
                     keyword_conditions.append(
-                        "(title LIKE %s OR description LIKE %s OR summary LIKE %s)"
+                        "(m.title LIKE %s OR m.description LIKE %s OR mr.summary LIKE %s)"
                     )
                     params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
                 
-                # 여러 키워드면 AND, 단일 키워드면 그대로
+                # 여러 키워드면 AND, 단일 키워드면 OR
                 if len(keywords) > 1:
                     query += " AND (" + " AND ".join(keyword_conditions) + ")"
                 else:
                     query += " AND (" + " OR ".join(keyword_conditions) + ")"
-                    
+                
+                print(f"[DEBUG] 키워드 조건 추가: {keywords}")
+
             from datetime import datetime
 
             # 오늘 날짜인지 확인
@@ -814,10 +1008,12 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
             if date_info and date_info.get('start_date'):
                 query += " AND scheduled_at >= %s"
                 params.append(date_info['start_date'])
+                print(f"[DEBUG] start_date: {date_info['start_date']}")
 
             if date_info and date_info.get('end_date'):
                 query += " AND scheduled_at <= %s"
                 params.append(date_info['end_date'])
+                print(f"[DEBUG] end_date: {date_info['end_date']}")
 
             # 상태 조건
             if status and not is_today_query:  # 오늘 쿼리가 아닐 때만 상태 필터 적용
@@ -843,11 +1039,11 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                         
             # ========== 컨텍스트로 특정 회의만 검색 ==========
             if selected_meeting_id:
-                query += " AND id = %s"
+                query += " AND m.id = %s"
                 params.append(selected_meeting_id)
                 print(f"[컨텍스트 필터] 회의 ID={selected_meeting_id}만 검색")
             
-            query += " ORDER BY scheduled_at DESC LIMIT 50"
+            query += " GROUP BY m.id ORDER BY scheduled_at DESC LIMIT 50"
 
             print(f"[DEBUG] SQL: {query}")
             print(f"[DEBUG] Params: {params}")
@@ -858,6 +1054,12 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
             
             print(f"[DEBUG] 검색 결과: {len(meetings)}개")
 
+            if meetings and len(meetings) > 0:
+                print(f"[DEBUG] ✅ 회의 발견! 첫 번째 회의: {meetings[0].get('title', 'N/A')}")
+                print(f"[DEBUG] 완전 일치 체크 시작")
+            else:
+                print(f"[DEBUG] ❌ meetings 리스트가 비어있음 또는 None")
+
             # ========== 완전 일치 체크 ==========
             if len(meetings) > 1:
                 user_query_lower = user_query.lower().strip()
@@ -867,17 +1069,18 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                         print(f"[DEBUG] 완전 일치 발견: {meeting.get('title')}")
                         meetings = [meeting]  # 단일 회의로 변경
                         break
-            
+            print(f"[DEBUG] 완전 일치 체크 완료, meetings 개수: {len(meetings)}")
+
             # ========== Phase 2-A: 페르소나 정렬 적용 ==========
             # 키워드 검색이 있으면 키워드 매칭 점수로 정렬
             if keywords and meetings and len(meetings) > 1:
                 # 키워드 매칭 점수 계산
                 for meeting in meetings:
                     score = 0
-                    title = meeting.get('title', '').lower()
-                    description = meeting.get('description', '').lower()
-                    summary = meeting.get('summary', '').lower()
-                    
+                    title = (meeting.get('title') or '').lower()
+                    description = (meeting.get('description') or '').lower()
+                    summary = (meeting.get('summary') or '').lower()
+
                     for keyword in keywords:
                         if keyword.lower() in title:
                             score += 10
@@ -896,37 +1099,56 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 for i, m in enumerate(meetings[:3]):
                     print(f"  {i+1}. {m.get('title')} (키워드 점수: {m.get('keyword_score', 0)})")
                 
-                # 유사도 기반 단일 회의 판단
+                # 유사도 기반 단일 회의 판단 (회의 제외)
                 if len(meetings) > 1:
                     import difflib
-                    user_query_clean = user_query.lower().strip()
+                    import re
+                    
+                    # "회의" 제거 함수
+                    def remove_meeting_word(text):
+                        return re.sub(r'회의|미팅', '', text).strip()
+                    
+                    user_query_clean = remove_meeting_word(user_query.lower().strip())
                     
                     # 각 회의 제목과의 유사도 계산
                     similarities = []
                     for meeting in meetings:
-                        title = meeting.get('title', '').lower().strip()
-                        # difflib로 유사도 계산 (0.0 ~ 1.0)
-                        ratio = difflib.SequenceMatcher(None, user_query_clean, title).ratio()
-                        similarities.append((meeting, ratio))
-                        print(f"  - '{meeting.get('title')}' 유사도: {ratio:.2%}")
+                        title_original = meeting.get('title', '').lower().strip()
+                        title_clean = remove_meeting_word(title_original)
+                        
+                        # "회의" 제거 후 유사도 계산
+                        ratio = difflib.SequenceMatcher(None, user_query_clean, title_clean).ratio()
+                        similarities.append((meeting, ratio, title_original))
+                        print(f"  - '{meeting.get('title')}' 유사도: {ratio:.2%} (비교: '{user_query_clean}' vs '{title_clean}')")
                     
                     # 가장 유사한 것 찾기
                     best_match = max(similarities, key=lambda x: x[1])
                     best_ratio = best_match[1]
                     
-                    # 유사도가 80% 이상이고, 2등과 차이가 20% 이상이면 단일 회의로 처리
-                    if best_ratio >= 0.8:
+                    # 유사도가 70% 이상이고, 2등과 차이가 20% 이상이면 단일 회의로 처리
+                    if best_ratio >= 0.7:  # ← 80% → 70%로 하향
                         second_best_ratio = sorted(similarities, key=lambda x: x[1], reverse=True)[1][1] if len(similarities) > 1 else 0
                         ratio_diff = best_ratio - second_best_ratio
                         
                         if ratio_diff >= 0.2:
                             print(f"[DEBUG] 유사도 {best_ratio:.1%} (차이: {ratio_diff:.1%}) → 단일 회의로 처리")
                             meetings = [best_match[0]]
+                        else:
+                            print(f"[DEBUG] 유사도 {best_ratio:.1%}이지만 2등과 차이({ratio_diff:.1%}) 부족 → 새로운 검색")
+                    else:
+                        print(f"[DEBUG] 최고 유사도 {best_ratio:.1%} < 70% → 새로운 검색")
 
             elif ENABLE_PERSONA and user_job and meetings and len(meetings) > 1:
+                print(f"[DEBUG] Phase 2-A 페르소나 정렬 시작: user_job={user_job}, meetings={len(meetings)}개")
                 meetings = search_with_persona(meetings, user_job)
-                print(f"[DEBUG] Phase 2-A: {user_job} 관련도 순으로 정렬")
+                print(f"[DEBUG] Phase 2-A: {user_job} 관련도 순으로 정렬 완료")
+            else:
+                print(f"[DEBUG] 페르소나 정렬 건너뜀 (ENABLE_PERSONA={ENABLE_PERSONA}, user_job={user_job}, len(meetings)={len(meetings) if meetings else 0})")
 
+            print(f"[DEBUG] 포맷팅 전 최종 확인: meetings 개수={len(meetings) if meetings else 0}")
+            if meetings:
+                print(f"[DEBUG] 첫 번째 회의: {meetings[0].get('title', 'N/A')}")
+                
             # 4. 결과 포맷팅 (실패 시 단계적 완화)
             if not meetings:
                 print(f"[DEBUG] 검색 실패 → 단계적 완화 시작")
@@ -934,27 +1156,45 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 # ===== 1단계: status 제거 =====
                 if status:
                     print(f"[DEBUG] 1단계 완화: status 제거")
-                    query_fallback = "SELECT * FROM Meeting WHERE 1=1"
+                    query_fallback = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                        FROM meeting m
+                        LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                        INNER JOIN participant p ON m.id = p.meeting_id
+                        WHERE 1=1"""
                     params_fallback = []
+                    
+                    # user_name 조건 추가!
+                    if user_name:
+                        query_fallback += " AND p.name = %s"
+                        params_fallback.append(user_name)
+                        print(f"[DEBUG] 1단계 완화: user_name 필터 추가: {user_name}")
                     
                     if keywords:
                         keyword_conditions = []
                         for keyword in keywords:
-                            keyword_conditions.append("(title LIKE %s OR description LIKE %s OR summary LIKE %s)")
+                            keyword_conditions.append("(m.title LIKE %s OR m.description LIKE %s OR mr.summary LIKE %s)")
                             params_fallback.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
                         query_fallback += " AND (" + " OR ".join(keyword_conditions) + ")"
-                    
+                        
                     if date_info and date_info.get('start_date'):
                         query_fallback += " AND scheduled_at >= %s"
                         params_fallback.append(date_info['start_date'])
+                        print(f"[DEBUG] start_date: {date_info['start_date']}")
+
                     if date_info and date_info.get('end_date'):
                         query_fallback += " AND scheduled_at <= %s"
                         params_fallback.append(date_info['end_date'])
-                    
-                    query_fallback += " ORDER BY scheduled_at DESC LIMIT 50"
+                        print(f"[DEBUG] end_date: {date_info['end_date']}")
+                        
+                    query_fallback += " GROUP BY m.id ORDER BY scheduled_at DESC LIMIT 50"
                     cursor.execute(query_fallback, params_fallback)
                     meetings_fallback = cursor.fetchall()
                     
+                    print(f"[DEBUG] 1단계 완화 쿼리 실행 완료")
+                    print(f"[DEBUG] query_fallback: {query_fallback}")
+                    print(f"[DEBUG] params_fallback: {params_fallback}")
+                    print(f"[DEBUG] meetings_fallback 개수: {len(meetings_fallback) if meetings_fallback else 0}")
+
                     if meetings_fallback:
                         status_kr = {'COMPLETED': '완료된', 'SCHEDULED': '예정된', 'RECORDING': '진행중'}
                         other_status = meetings_fallback[0]['status']
@@ -1009,7 +1249,7 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                             found_status_text = '/'.join(found_statuses) if found_statuses else '다른'
                             
                             # detail 생성
-                            detail = format_multiple_meetings_short(meetings_fallback[:5], user_query, len(meetings_fallback) if len(meetings_fallback) > 5 else None, date_info, None)
+                            detail, _, _ = format_multiple_meetings_short(meetings_fallback[:5], user_query, len(meetings_fallback) if len(meetings_fallback) > 5 else None, date_info, None)
                             
                             if status:
                                 # status가 있으면
@@ -1030,19 +1270,73 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                                     
                 # ===== 2단계: 날짜 제거, 키워드만 검색 =====
                 if date_info and date_info.get('start_date'):
-                    # 의미있는 키워드가 있으면 → 날짜만 제거하고 키워드로 재검색
-                    meaningful_keywords = [k for k in keywords if k not in ['있어', '없어', '뭐', '거', '것', '회의']]
-                    # "15일", "일", "월" 같은 날짜 관련 단어도 제거
+                    print(f"[DEBUG] 2단계 시작: keywords={keywords}, len={len(keywords) if keywords else 0}")
+                    
+                    # 각 키워드를 DB 제목들과 비교해서 유사도 체크 (먼저)
+                    import difflib
+                    import re
+
+                    corrected_keywords = []
+                    for keyword in keywords:  # keywords 전체 사용
+                        print(f"[DEBUG] 유사도 체크 시작: keyword='{keyword}'")
+                        
+                        # DB에서 모든 회의 제목 가져오기
+                        if user_id:
+                            cursor.execute("SELECT DISTINCT title FROM meeting WHERE host_user_id = %s", (user_id,))
+                        else:
+                            cursor.execute("SELECT DISTINCT title FROM meeting")
+                        all_titles = [row['title'] for row in cursor.fetchall()]
+                        
+                        print(f"[DEBUG] DB 제목 개수: {len(all_titles)}")
+                        
+                        # 제목에서 단어 추출
+                        all_words = set()
+                        for title in all_titles:
+                            all_words.update(re.findall(r'[가-힣]+', title))
+                        
+                        print(f"[DEBUG] 추출된 단어 개수: {len(all_words)}")
+                        print(f"[DEBUG] 추출된 단어 샘플 (최대 10개): {list(all_words)[:10]}")
+
+                        # 유사도가 70% 이상인 단어 찾기
+                        best_match = None
+                        best_ratio = 0
+                        for word in all_words:
+                            ratio = difflib.SequenceMatcher(None, keyword, word).ratio()
+                            if ratio > best_ratio and ratio >= 0.7:
+                                best_ratio = ratio
+                                best_match = word
+                        
+                        print(f"[DEBUG] '{keyword}' 최고 유사도: {best_ratio:.1%}, 매치: {best_match}")
+
+                        if best_match:
+                            print(f"[DEBUG] 오타 보정: '{keyword}' → '{best_match}' (유사도: {best_ratio:.1%})")
+                            corrected_keywords.append(best_match)
+                        else:
+                            print(f"[DEBUG] 오타 보정 실패: '{keyword}' (최고 유사도 {best_ratio:.1%} < 70%)")
+                            corrected_keywords.append(keyword)
+                    
+                    # 이제 의미있는 키워드만 필터링
+                    meaningful_keywords = [k for k in corrected_keywords if k not in ['있어', '없어', '뭐', '거', '것', '회의']]
                     meaningful_keywords = [k for k in meaningful_keywords if not any(x in k for x in ['일', '월', '주', '년'])]
                     
                     if meaningful_keywords:
                         print(f"[DEBUG] 2단계 완화: 날짜 제거, 키워드만 검색 (키워드: {meaningful_keywords})")
-                        query_fallback = "SELECT * FROM Meeting WHERE 1=1"
+                        query_fallback = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                            FROM meeting m
+                            LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                            INNER JOIN participant p ON m.id = p.meeting_id
+                            WHERE 1=1"""
                         params_fallback = []
                         
+                        # user_name 조건 추가!
+                        if user_name:
+                            query_fallback += " AND p.name = %s"
+                            params_fallback.append(user_name)
+                            print(f"[DEBUG] 2단계 완화: user_name 필터 추가: {user_name}")
+                        
                         keyword_conditions = []
-                        for keyword in meaningful_keywords:  # ← meaningful_keywords 사용!
-                            keyword_conditions.append("(title LIKE %s OR description LIKE %s OR summary LIKE %s)")
+                        for keyword in meaningful_keywords:
+                            keyword_conditions.append("(m.title LIKE %s OR m.description LIKE %s OR mr.summary LIKE %s)")
                             params_fallback.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
                         query_fallback += " AND (" + " OR ".join(keyword_conditions) + ")"
                         
@@ -1050,37 +1344,65 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                             query_fallback += " AND status = %s"
                             params_fallback.append(status)
                         
-                        query_fallback += " ORDER BY scheduled_at DESC LIMIT 50"
+                        query_fallback += " GROUP BY m.id ORDER BY scheduled_at DESC LIMIT 50"
                         cursor.execute(query_fallback, params_fallback)
                         meetings_fallback = cursor.fetchall()
                         
                         if meetings_fallback:
                             print(f"[DEBUG] 2단계 완화 성공 (날짜 제거): {len(meetings_fallback)}개 발견")
                             
+                            # meetings 변수 덮어쓰기 (아래 일반 로직 방지)
+                            meetings = meetings_fallback
+                            
                             # 페르소나 정렬
                             if ENABLE_PERSONA and user_job and len(meetings_fallback) > 1:
                                 meetings_fallback = search_with_persona(meetings_fallback, user_job)
+                                meetings = meetings_fallback  # 정렬 후에도 동기화
                             
-                            keyword_str = ', '.join(meaningful_keywords)  # ← meaningful_keywords 사용!
+                            keyword_str = ', '.join(meaningful_keywords)
                             original_date = date_info.get('original', '')
-                            
+
                             from .formatting import format_multiple_meetings_short
-                            detail = format_multiple_meetings_short(meetings_fallback[:3], user_query, len(meetings_fallback) if len(meetings_fallback) > 3 else None, None, status)
-                            
-                            message = f"""❌ {original_date} '{keyword_str}' 관련 회의가 없어요.
+
+                            try:
+                                # 5개 초과일 때만 total 전달 (나머지 멘트 표시)
+                                total_for_format = len(meetings_fallback) if len(meetings_fallback) > 5 else None
+                                detail, _, _ = format_multiple_meetings_short(
+                                    meetings_fallback[:5],
+                                    user_query, 
+                                    total_for_format,
+                                    None,
+                                    status
+                                )
+                                
+                                # 헤더 제거
+                                if detail.startswith("네, "):
+                                    lines = detail.split('\n')
+                                    filtered_lines = []
+                                    for line in lines[1:]:
+                                        if "나머지 보여줘" not in line:
+                                            filtered_lines.append(line)
+                                    detail = '\n'.join(filtered_lines)
+                                
+                                # 상태 표시
+                                status_kr = {'COMPLETED': '완료된', 'SCHEDULED': '예정된', 'RECORDING': '진행중'}
+                                status_text = status_kr.get(status, '') if status else ''
+                                
+                                message = f"""❌ {original_date}에 {status_text} '{keyword_str}' 회의가 없어요. 😢
 
 하지만 다른 날짜에 '{keyword_str}' 회의가 있어요! 📋
-
 {detail}"""
-                            
-                            return (message, meetings_fallback)
-                        else:
-                            # 키워드로도 없음
-                            print(f"[DEBUG] 2단계 완화 실패 (키워드로도 없음)")
-                    else:
-                        # 의미있는 키워드 없음 (날짜만 있음)
-                        print(f"[DEBUG] 2단계 완화 불가 (의미있는 키워드 없음)")
-                        
+                                
+                                print(f"[DEBUG] 2단계 완화 메시지 생성 완료, return 직전")
+                                print(f"[DEBUG] message 길이: {len(message)}")
+                                
+                                message = "[FALLBACK_SUCCESS]" + message
+                                return (message, meetings_fallback)
+
+                            except Exception as e:
+                                print(f"[ERROR] 2단계 완화 메시지 생성 실패: {e}")
+                                import traceback
+                                traceback.print_exc()
                 
                 # ===== 최종 실패 =====
                 print(f"[DEBUG] 모든 완화 실패")
@@ -1146,13 +1468,24 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
             
             # 여러 회의
             total = len(meetings)
-            message = format_multiple_meetings_short(
-                meetings,
-                user_query,
-                total,  # 항상 전달!
-                date_info,
-                status
-            )
+            print(f"[DEBUG] 여러 회의 포맷팅 시작: total={total}, meetings 타입={type(meetings)}")
+            print(f"[DEBUG] 첫 번째 회의 키: {list(meetings[0].keys()) if meetings else 'None'}")
+
+            try:
+                message, _, _ = format_multiple_meetings_short(
+                    meetings,
+                    user_query,
+                    total,
+                    date_info,
+                    status
+                )
+                print(f"[DEBUG] 포맷팅 성공: {len(message)}자")
+            except Exception as format_error:
+                print(f"[ERROR] format_multiple_meetings_short 실패: {format_error}")
+                import traceback
+                traceback.print_exc()
+                raise  # 원래 예외 다시 발생
+
             return (message, meetings)
         
         except Exception as e:
@@ -1202,11 +1535,12 @@ def calculate_relevance(meeting: dict, user_job: str) -> float:
     summary = (meeting.get('summary') or '').lower()
     
     for keyword in keywords:
-        if keyword in title:
+        keyword_lower = keyword.lower()
+        if keyword_lower in title:
             score += 10
-        if keyword in summary:
+        if summary and keyword_lower in summary:
             score += 5
-        if keyword in description:
+        if description and keyword_lower in description:
             score += 3
     
     return score
@@ -1323,7 +1657,7 @@ def parse_meetings_list(lambda_response: str) -> list:
 # ============================================================
 # Phase 3: 통계 쿼리 (COUNT)
 # ============================================================
-def search_meeting_count(keywords=None, date_info=None, status=None, user_job=None):
+def search_meeting_count(keywords=None, date_info=None, status=None, user_job=None, user_name=None):
     """회의 개수 세기 + 날짜 목록 (페르소나 정렬 포함)"""
     with get_db_connection() as conn:
         if not conn:
@@ -1333,15 +1667,25 @@ def search_meeting_count(keywords=None, date_info=None, status=None, user_job=No
             cursor = conn.cursor()
             
             # COUNT 쿼리
-            query = "SELECT COUNT(*) as count FROM Meeting WHERE 1=1"
+            query = """SELECT COUNT(DISTINCT m.id) as count 
+                FROM meeting m 
+                LEFT JOIN meeting_result mr ON m.id = mr.meeting_id 
+                INNER JOIN participant p ON m.id = p.meeting_id
+                WHERE 1=1"""
             params = []
+            
+            # user_name 조건
+            if user_name:
+                query += " AND p.name = %s"
+                params.append(user_name)
+                print(f"[DEBUG] COUNT user_name 필터: {user_name}")
             
             # 키워드 조건
             if keywords:
                 keyword_conditions = []
                 for keyword in keywords:
                     keyword_conditions.append(
-                        "(title LIKE %s OR description LIKE %s OR summary LIKE %s)"
+                        "(m.title LIKE %s OR m.description LIKE %s OR mr.summary LIKE %s)"
                     )
                     params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
                 
@@ -1351,30 +1695,52 @@ def search_meeting_count(keywords=None, date_info=None, status=None, user_job=No
             if date_info and date_info.get('start_date'):
                 query += " AND scheduled_at >= %s"
                 params.append(date_info['start_date'])
-            
-            if date_info and date_info.get('end_date'):
+                print(f"[DEBUG] start_date: {date_info['start_date']}")
+
+            if date_info.get('end_date'):
                 query += " AND scheduled_at <= %s"
                 params.append(date_info['end_date'])
+                print(f"[DEBUG] end_date: {date_info['end_date']}")
             
             # 상태 조건
             if status:
                 from datetime import datetime
                 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 
+                # 사용자가 날짜를 명시했는지 확인
+                user_specified_date = date_info and date_info.get('type') is not None
+                
                 if status == 'SCHEDULED':
-                    # 예정된 회의: 오늘 00:00 이후
-                    query += " AND status = %s AND scheduled_at >= %s"
+                    # 예정된 회의
+                    query += " AND status = %s"
                     params.append(status)
-                    params.append(today)
+                    
+                    # 날짜 명시 안 했으면 오늘 이후만
+                    if not user_specified_date:
+                        query += " AND scheduled_at >= %s"
+                        params.append(today)
+                        print(f"[DEBUG] 예정된 회의 → 오늘({today.date()}) 이후만 검색")
+                    else:
+                        print(f"[DEBUG] 날짜 명시({date_info.get('original')}) → 오늘 이후 필터 해제")
+                
                 elif status == 'COMPLETED':
-                    # 완료된 회의: 오늘 00:00 이전
-                    query += " AND status = %s AND scheduled_at < %s"
+                    # 완료된 회의
+                    query += " AND status = %s"
                     params.append(status)
-                    params.append(today)
+                    
+                    # 날짜 명시 안 했으면 오늘 이전만
+                    if not user_specified_date:
+                        query += " AND scheduled_at < %s"
+                        params.append(today)
+                        print(f"[DEBUG] 완료된 회의 → 오늘({today.date()}) 이전만 검색")
+                    else:
+                        print(f"[DEBUG] 날짜 명시({date_info.get('original')}) → 오늘 이전 필터 해제")
+                
                 else:
                     # RECORDING은 날짜 제한 없음
                     query += " AND status = %s"
                     params.append(status)
+                    print(f"[DEBUG] 진행중 회의 → 날짜 제한 없음")
             
             print(f"[DEBUG] COUNT SQL: {query}")
             print(f"[DEBUG] Params: {params}")
@@ -1388,7 +1754,7 @@ def search_meeting_count(keywords=None, date_info=None, status=None, user_job=No
             
             # 날짜 목록 가져오기 (최대 제한 없음!)
             date_query = query.replace("COUNT(*) as count", "scheduled_at, title, description, summary, id, status, host_user_id")
-            date_query += " ORDER BY scheduled_at DESC"  # ← LIMIT 제거!
+            date_query += " ORDER BY scheduled_at DESC"
             
             cursor.execute(date_query, params)
             meetings = cursor.fetchall()
@@ -1408,7 +1774,6 @@ def search_meeting_count(keywords=None, date_info=None, status=None, user_job=No
             import traceback
             traceback.print_exc()
             return None
-        
 
 # ============================================================
 # 통계 결과 포맷팅
@@ -1455,376 +1820,453 @@ def search_tasks(user_query: str, user_id: int = 1, meeting_id: int = None, user
     Returns:
         (message, tasks) 튜플
     """
-    from .config import DB_CONFIG
-    
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
+    with get_db_connection() as conn:
+        if not conn:
+            return ("데이터베이스 연결 실패", [])
         
-        # ========== 타인 이름 감지 (meeting_id 무시) ==========
-
-        # DB에서 사용자 이름 조회
-        cursor.execute("SELECT name FROM User WHERE id = %s", (user_id,))
-        current_user_result = cursor.fetchone()
-        current_user_name = current_user_result['name'] if current_user_result else '알 수 없음'
-
-        cursor.execute("SELECT name FROM User WHERE id != %s", (user_id,))
-        other_names = [row['name'] for row in cursor.fetchall()]
-
-        print(f"[DEBUG] 현재 사용자: {current_user_name}, 다른 사용자: {other_names}")
-
-        # DB에서 사용자 이름 조회
-        cursor.execute("SELECT name FROM User WHERE id = %s", (user_id,))
-        current_user_result = cursor.fetchone()
-        current_user_name = current_user_result['name'] if current_user_result else '알 수 없음'
-        
-        cursor.execute("SELECT name FROM User WHERE id != %s", (user_id,))
-        other_names = [row['name'] for row in cursor.fetchall()]
-        
-        print(f"[DEBUG] 현재 사용자: {current_user_name}, 다른 사용자: {other_names}")
-
-        query_lower = user_query.lower() 
-
-        # 다른 사람 이름이 쿼리에 있으면 meeting_id 무시
-        # 단, 회의 대명사가 있으면 meeting_id 유지 (오타 허용)
-        def has_meeting_pronoun(query: str) -> bool:
-            import re, difflib
-            cleaned = re.sub(r'[^\w\s]', '', query)
-            tokens = cleaned.split()
-            pronoun_tokens = {'저', '그', '이', '해당'}
+        try:
+            cursor = conn.cursor()
             
-            for i in range(len(tokens)):
-                if tokens[i] in pronoun_tokens and i + 1 < len(tokens):
-                    next_token = tokens[i + 1]
-                    # 조사 제거
-                    next_token_no_josa = re.sub(r'에서|에게|한테|부터|까지', '', next_token)
-                    # 한글만 추출
-                    next_token_clean = re.sub(r'[^가-힣]', '', next_token_no_josa)
-                    
-                    # "회의", "미팅"과 유사도
-                    similarity_meeting = difflib.SequenceMatcher(None, next_token_clean, '회의').ratio()
-                    if similarity_meeting >= 0.5:
-                        return True
+            # DB에서 사용자 이름 조회
+            cursor.execute("SELECT name FROM user WHERE id = %s", (user_id,))
+            current_user_result = cursor.fetchone()
+            current_user_name = current_user_result['name'] if current_user_result else '알 수 없음'
             
-            # 단독 지시어
-            if any(ref in query for ref in ['거기', '여기']):
-                return True
-            return False
-        
-        has_meeting_reference = has_meeting_pronoun(user_query)
-        
-        found_name = None  # 여기서 미리 선언
-        
-        for name in other_names:
-            if name in user_query:
-                if not has_meeting_reference:
-                    print(f"[DEBUG] 타인 이름 '{name}' 감지 → meeting_id 무시, 전체 검색")
-                    meeting_id = None
-                    found_name = name  # 이름 저장
-                else:
-                    print(f"[DEBUG] 타인 이름 '{name}' + 회의 대명사 감지 → meeting_id 유지 (특정 회의 검색)")
-                    found_name = name  # 이름 저장
-                    print(f"[DEBUG] found_name 저장: {found_name}")
-                break
-        
-        # "전체", "모든", "다른" 등이 있으면 대명사 체크 무시
-        has_global_keywords = any(word in query_lower for word in ['전체', '모든', '전부', '다른', '말고'])
-
-        if not meeting_id and not has_global_keywords and any(word in query_lower for word in ['저 회의', '그 회의', '이 회의', '거기']):
-            return ("어떤 회의인지 먼저 말씀해주세요! 😊\n예: '채용 전략 회의에서 할 일'", [])
-
-        # 상태 필터링 감지
-        status_filter = ""
-        if any(keyword in query_lower for keyword in ['완료', '끝난', '완료한']):
-            status_filter = "AND t.status = 'COMPLETED'"
-            status_text = "완료한"
-        elif any(keyword in query_lower for keyword in ['미완료', '남은', '해야', '할']):
-            status_filter = "AND t.status = 'TODO'"
-            status_text = "해야 할"
-        else:
-            # 기본: TODO만 (미완료 작업이 중요하므로)
-            status_filter = "AND t.status = 'TODO'"
-            status_text = ""
-        
-        # 1. "내가 맡은 일" 패턴
-        if any(pattern in query_lower for pattern in ['내가', '나의', '내 할일', '내 할 일', '나는?', '나는', '내꺼는?', '내꺼는', '내가?', '내가']):
-            # meeting_id가 있고 "전체"가 없으면 특정 회의 내에서 검색
-            if meeting_id and not any(word in query_lower for word in ['전체', '모든', '다', '전부']):
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.user_id = %s AND t.meeting_id = %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (user_id, meeting_id))
-                tasks = cursor.fetchall()
+            cursor.execute("SELECT name FROM user WHERE id != %s", (user_id,))
+            other_names = [row['name'] for row in cursor.fetchall()]
+            
+            print(f"[DEBUG] 현재 사용자: {current_user_name}, 다른 사용자: {other_names}")
+            
+            query_lower = user_query.lower()
+            
+            # ========== 함수 정의 ==========
+            def has_meeting_pronoun(query: str) -> bool:
+                import re, difflib
+                cleaned = re.sub(r'[^\w\s]', '', query)
+                tokens = cleaned.split()
+                pronoun_tokens = {'저', '그', '이', '해당'}
                 
-                # 회의 제목 추출
-                meeting_title = tasks[0].get('meeting_title') if tasks else None
-                if not meeting_title:
-                    cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                    result = cursor.fetchone()
-                    meeting_title = result['title'] if result else None
+                for i in range(len(tokens)):
+                    if tokens[i] in pronoun_tokens and i + 1 < len(tokens):
+                        next_token = tokens[i + 1]
+                        next_token_no_josa = re.sub(r'에서|에게|한테|부터|까지', '', next_token)
+                        next_token_clean = re.sub(r'[^가-힣]', '', next_token_no_josa)
+                        similarity_meeting = difflib.SequenceMatcher(None, next_token_clean, '회의').ratio()
+                        if similarity_meeting >= 0.5:
+                            return True
                 
-                # meeting_title 없으면 DB에서 조회
-                if not meeting_title and meeting_id:
-                    cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                    result = cursor.fetchone()
-                    meeting_title = result['title'] if result else None
-                
-                # "내가" 할일이므로 내 할일만 표시
-                if not tasks or len(tasks) == 0:
-                    if meeting_title:
-                        if user_name:
-                            return (f"{meeting_title}에서 {user_name}님이 맡은 일이 없어요! 😊", [])
-                        return (f"{meeting_title}에서 맡은 일이 없어요! 😊", [])
-                    if user_name:
-                        return (f"이 회의에서 {user_name}님이 맡은 일이 없어요! 😊", [])
-                    return ("이 회의에서 맡은 일이 없어요! 😊", [])
-
-                # 할일 목록 표시
-                message = f"📋 {meeting_title} 회의에서 맡은 할 일 {len(tasks)}개:\n\n"
-                for i, task in enumerate(tasks[:10], 1):
-                    title = task.get('title', '제목 없음')
-                    due_date = task.get('due_date')
-                    status = task.get('status', 'TODO')
-                    status_emoji = "✅" if status == 'COMPLETED' else "⏳"
-                    
-                    if due_date:
-                        due_str = f"📅 {due_date.strftime('%m월 %d일')}"
+                if any(ref in query for ref in ['거기', '여기']):
+                    return True
+                return False
+            
+            has_meeting_reference = has_meeting_pronoun(user_query)
+            found_name = None
+            
+            for name in other_names:
+                if name in user_query:
+                    if not has_meeting_reference:
+                        print(f"[DEBUG] 타인 이름 '{name}' 감지 → meeting_id 무시, 전체 검색")
+                        meeting_id = None
+                        found_name = name
                     else:
-                        due_str = "📅 기한 없음"
-                    
-                    message += f"{status_emoji} {i}. {title}\n"
-                    message += f"   {due_str}\n\n"
+                        print(f"[DEBUG] 타인 이름 '{name}' + 회의 대명사 감지 → meeting_id 유지 (특정 회의 검색)")
+                        found_name = name
+                    break
+            
+            # "전체", "모든", "다른" 등이 있으면 대명사 체크 무시
+            has_global_keywords = any(word in query_lower for word in ['전체', '모든', '전부', '다른', '말고'])
 
-                return (message, tasks)
+            if not meeting_id and not has_global_keywords and any(word in query_lower for word in ['저 회의', '그 회의', '이 회의', '거기']):
+                return ("어떤 회의인지 먼저 말씀해주세요! 😊\n예: '채용 전략 회의에서 할 일'", [])
 
+            # 상태 필터링 감지
+            status_filter = ""
+            if any(keyword in query_lower for keyword in ['완료', '끝난', '완료한']):
+                status_filter = "AND t.status = 'COMPLETED'"
+                status_text = "완료한"
+            elif any(keyword in query_lower for keyword in ['미완료', '남은', '해야', '할']):
+                status_filter = "AND t.status = 'TODO'"
+                status_text = "해야 할"
             else:
-                # 전체 검색
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.user_id = %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (user_id,))
+                status_filter = "AND t.status = 'TODO'"
+                status_text = ""
+
+            # 0. "이미 한", "완료한" 패턴 (완료된 Task)
+            if any(pattern in query_lower for pattern in ['이미', '완료', '끝난', '다 한', '한 거', '한 것']):
+                print(f"[DEBUG] 완료된 Task 검색")
+                
+                status_filter = "AND t.status = 'COMPLETED'"
+                status_text = "완료한"
+                
+                # meeting_id가 있고 "전체"가 없으면 특정 회의 내에서 검색
+                if meeting_id and not any(word in query_lower for word in ['전체', '모든', '전부']):
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.user_id = %s AND t.meeting_id = %s {status_filter}
+                        ORDER BY t.updated_at DESC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (user_id, meeting_id))
+                else:
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.user_id = %s {status_filter}
+                        ORDER BY t.updated_at DESC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (user_id,))
+                
                 tasks = cursor.fetchall()
                 
-                if not tasks:
-                    if status_text:
-                        if user_name:
-                            return (f"{user_name}님의 {status_text} 일이 없어요! 😊", [])
-                        return (f"{status_text} 일이 없어요! 😊", [])
-                    if user_name:
-                        return (f"{user_name}님이 아직 맡은 일이 없어요! 😊", [])
-                    return ("아직 맡은 일이 없어요! 😊", [])
+                # Action Item도 조회해서 합치기
+                action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                tasks = merge_tasks_and_actions(list(tasks), action_items)
 
+                if not tasks:
+                    return (f"아직 완료한 일이 없어요! 😊", [])
+                
                 message = format_my_tasks(tasks, status_text)
                 return (message, tasks)
-        
-        # 2. "다른 사람" 패턴 (구체적이므로 먼저 체크)
-        elif (any(pattern in query_lower for pattern in ['다른 사람', '다른사람', '다른 담당', '다른담당']) or
-            ('회의에서' in query_lower and any(pattern in query_lower for pattern in ['다른 사람', '다른사람', '아무도', '전체', '모두']))):
-            if meeting_id:
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.meeting_id = %s AND t.user_id != %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (meeting_id, user_id))
-                tasks = cursor.fetchall()
-                
-                if not tasks:
-                    cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                    result = cursor.fetchone()
-                    meeting_title = result['title'] if result else None
+            
+            # 0. "이미 한", "완료한" 패턴
+                completed_keywords = ['이미', '완료', '끝난', '다 한', '한 거', '한 것', '했던']
+                if any(keyword in query_lower for keyword in completed_keywords):
+                    print(f"[DEBUG] 완료된 Task 검색")
                     
-                    if meeting_title:
-                        return (f"{meeting_title}에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
-                    return ("이 회의에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
-                
-                # meeting_title 추출
-                meeting_title = tasks[0].get('meeting_title') if tasks else None
-                message = format_meeting_tasks(tasks, meeting_title)
-                return (message, tasks)
-            else:  # ← 추가
-                return ("어떤 회의의 담당자를 보고 싶으신가요? 😊", [])
-                
-        # 3. meeting_id만 있고 found_name이 없는 경우
-        elif meeting_id and not found_name:
-            # "다른 사람" 관련 질문 감지 (오타 포함)
-            suspect_patterns = [
-                '다른', '다름', '딴', '사람', '담당', '팀원', '멤버', '누가', 
-                '아무', '모두', '전체', '나머지', '누구', '그외', '그 외',
-                '다른이', '다른 이', '다른애', '다른 애'
-            ]
-            
-            is_asking_others = any(w in query_lower for w in suspect_patterns)
-            
-            if is_asking_others:
-                # 다른 사람 할일 검색 (현재 사용자 제외)
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.meeting_id = %s AND t.user_id != %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (meeting_id, user_id))  # user_id 추가!
-                tasks = cursor.fetchall()
-                
-                if not tasks:
-                    cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                    result = cursor.fetchone()
-                    meeting_title = result['title'] if result else None
+                    status_filter = "AND t.status = 'COMPLETED'"
                     
-                    if meeting_title:
-                        return (f"네, {meeting_title}에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
-                    return ("네, 이 회의에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
-                
-                meeting_title = tasks[0].get('meeting_title') if tasks else None
-                message = format_meeting_tasks(tasks, meeting_title)
-                return (message, tasks)
-            
-            else:
-                # "저 회의에서 할일" - 전체 할일 표시
-                query = f"""
-                    SELECT t.*, u.name as assignee_real_name, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN User u ON t.user_id = u.id
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.meeting_id = %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (meeting_id,))
-                tasks = cursor.fetchall()
-                
-                # 회의 제목 추출
-                meeting_title = tasks[0].get('meeting_title') if tasks else None
-                if not meeting_title:
-                    cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                    result = cursor.fetchone()
-                    meeting_title = result['title'] if result else None
-                
-                if not tasks:
-                    if meeting_title:
-                        return (f"네, {meeting_title}에서 정한 할 일이 없어요! 😊", [])
-                    return ("네, 이 회의에서 정한 할 일이 없어요! 😊", [])
-                
-                message = format_meeting_tasks(tasks, meeting_title)
-                return (message, tasks)
-            
-        # 4. "담당자 이름" 패턴 (김철수, 이영희 등)
-        else:
-            # 이름 추출 - 조사 목록을 먼저 제거
-            import re
-            
-            # 이전에 이미 found_name이 설정된 경우 (회의 대명사 + 타인 이름)
-            if 'found_name' not in locals():
-                # 조사 제거
-                cleaned_query = user_query
-                josas = ['가', '이', '은', '는', '을', '를', '의', '와', '과', '에게', '한테', '께서', '님이', '님의', '님은', '님을']
-                for josa in josas:
-                    cleaned_query = cleaned_query.replace(josa, ' ')
-                
-                # 한글 이름 추출 (2-4글자)
-                # DB에서 실제 사용자 이름 목록 가져오기
-                cursor.execute("SELECT name FROM User")
-                all_user_names = [row['name'] for row in cursor.fetchall()]
-                
-                # 쿼리에서 실제 이름 찾기
-                found_name = None
-                for name in all_user_names:
-                    if name in user_query:
-                        found_name = name
-                        break
-            
-            if not found_name:
-                return ("담당자 이름을 말씀해주세요! 😊", [])
-            
-            name = found_name
+                    # meeting_id가 있고 "전체"가 없으면 특정 회의만
+                    if meeting_id and not any(word in query_lower for word in ['전체', '모든', '전부']):
+                        query = f"""
+                            SELECT t.*, m.title as meeting_title 
+                            FROM task t
+                            LEFT JOIN meeting m ON t.meeting_id = m.id
+                            WHERE t.user_id = %s AND t.meeting_id = %s {status_filter}
+                            ORDER BY t.updated_at DESC
+                            LIMIT 10
+                        """
+                        cursor.execute(query, (user_id, meeting_id))
+                    else:
+                        query = f"""
+                            SELECT t.*, m.title as meeting_title 
+                            FROM task t
+                            LEFT JOIN meeting m ON t.meeting_id = m.id
+                            WHERE t.user_id = %s {status_filter}
+                            ORDER BY t.updated_at DESC
+                            LIMIT 10
+                        """
+                        cursor.execute(query, (user_id,))
+                    
+                    tasks = cursor.fetchall()
 
-            # meeting_id가 있고 "전체"가 없으면 특정 회의 내에서 검색
-            has_global_intent = (
-                any(word in query_lower for word in ['전체', '모든', '전부', '전체에서', '전체적']) or
-                ('다른' in query_lower and any(w in query_lower for w in ['회의', '일', '할일', '것']))
-            )
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+                    
+                    if not tasks:
+                        return (f"아직 완료한 일이 없어요! 😊", [])
+                    
+                    message = format_my_tasks(tasks, "완료한")
+                    return (message, tasks)
+
+
+            my_task_keywords = ['내가', '나의', '내 할일', '내 할 일', '나는?', '나는', '내꺼는?', '내꺼는', '내가?', '내가', '해야 될', '해야될', '해야 되는', '해야되는', '남은', '미완료', '할일', '할 일', '뭐야', '뭐있', '뭐 있']
+            is_correction = query_lower.startswith('아니') and any(kw in query_lower for kw in ['할일', '할 일', 'task'])
             
-            if meeting_id and not has_global_intent:
-                # 특정 회의만
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.assignee_name LIKE %s AND t.meeting_id = %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (f'%{name}%', meeting_id))
-            else:
-                # 전체 검색
-                query = f"""
-                    SELECT t.*, m.title as meeting_title 
-                    FROM Task t
-                    LEFT JOIN Meeting m ON t.meeting_id = m.id
-                    WHERE t.assignee_name LIKE %s {status_filter}
-                    ORDER BY 
-                        CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
-                        t.due_date ASC
-                    LIMIT 10
-                """
-                cursor.execute(query, (f'%{name}%',))
-            
-            tasks = cursor.fetchall()
-            
-            # 디버깅
-            print(f"[DEBUG] 담당자 검색: name={name}, meeting_id={meeting_id if meeting_id else 'None'}")
-            print(f"[DEBUG] 검색 결과: {len(tasks)}개")
-            if tasks:
-                print(f"[DEBUG] 첫 번째 결과: {tasks[0]}")
+            if any(pattern in query_lower for pattern in my_task_keywords) or is_correction:
+
+                # meeting_id가 있고 "전체"가 없으면 특정 회의 내에서 검색
+                if meeting_id and not any(word in query_lower for word in ['전체', '모든', '다', '전부']):
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.user_id = %s AND t.meeting_id = %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (user_id, meeting_id))
+                    tasks = cursor.fetchall()
+
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+                    
+                    # 회의 제목 추출
+                    meeting_title = tasks[0].get('meeting_title') if tasks else None
+                    if not meeting_title:
+                        cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                        result = cursor.fetchone()
+                        meeting_title = result['title'] if result else None
+                    
+                    # meeting_title 없으면 DB에서 조회
+                    if not meeting_title and meeting_id:
+                        cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                        result = cursor.fetchone()
+                        meeting_title = result['title'] if result else None
+                    
+                    # "내가" 할일이므로 내 할일만 표시
+                    if not tasks or len(tasks) == 0:
+                        if meeting_title:
+                            if user_name:
+                                return (f"{meeting_title}에서 {user_name}님이 맡은 일이 없어요! 😊", [])
+                            return (f"{meeting_title}에서 맡은 일이 없어요! 😊", [])
+                        if user_name:
+                            return (f"이 회의에서 {user_name}님이 맡은 일이 없어요! 😊", [])
+                        return ("이 회의에서 맡은 일이 없어요! 😊", [])
+
+                    # 할일 목록 표시
+                    message = f"📋 {meeting_title} 회의에서 맡은 할 일 {len(tasks)}개:\n\n"
+                    for i, task in enumerate(tasks[:10], 1):
+                        title = task.get('title', '제목 없음')
+                        due_date = task.get('due_date')
+                        status = task.get('status', 'TODO')
+                        status_emoji = "✅" if status == 'COMPLETED' else "⏳"
                         
-            if not tasks:
-                if status_text:
-                    return (f"{name}님이 {status_text} 일을 찾을 수 없어요! 😊", [])
-                return (f"{name}님이 담당한 일을 찾을 수 없어요! 😊", [])
-            
-            message = format_assignee_tasks(tasks, name, status_text)
-            return (message, tasks)
-        
-    except Exception as e:
-        logger.error(f"Task 검색 실패: {e}")
-        import traceback
-        traceback.print_exc()
-        return ("Task 검색 중 오류가 발생했어요. 😢", [])
-    
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+                        if due_date:
+                            due_str = f"📅 {due_date.strftime('%m월 %d일')}"
+                        else:
+                            due_str = "📅 기한 없음"
+                        
+                        message += f"{status_emoji} {i}. {title}\n"
+                        message += f"   {due_str}\n\n"
 
+                    return (message, tasks)
+
+                else:
+                    # 전체 검색 (오늘 이후만)
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.user_id = %s AND t.due_date >= CURDATE() {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (user_id,))
+                    tasks = cursor.fetchall()
+
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+                    
+                    if not tasks:
+                        if status_text:
+                            if user_name:
+                                return (f"{user_name}님의 {status_text} 일이 없어요! 😊", [])
+                            return (f"{status_text} 일이 없어요! 😊", [])
+                        if user_name:
+                            return (f"{user_name}님이 아직 맡은 일이 없어요! 😊", [])
+                        return ("아직 맡은 일이 없어요! 😊", [])
+
+                    message = format_my_tasks(tasks, status_text)
+                    return (message, tasks)
+            
+            # 2. "다른 사람" 패턴 (구체적이므로 먼저 체크)
+            elif (any(pattern in query_lower for pattern in ['다른 사람', '다른사람', '다른 담당', '다른담당']) or
+                ('회의에서' in query_lower and any(pattern in query_lower for pattern in ['다른 사람', '다른사람', '아무도', '전체', '모두']))):
+                if meeting_id:
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.meeting_id = %s AND t.user_id != %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (meeting_id, user_id))
+                    tasks = cursor.fetchall()
+
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+
+                    if not tasks:
+                        cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                        result = cursor.fetchone()
+                        meeting_title = result['title'] if result else None
+                        
+                        if meeting_title:
+                            return (f"{meeting_title}에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
+                        return ("이 회의에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
+                    
+                    # meeting_title 추출
+                    meeting_title = tasks[0].get('meeting_title') if tasks else None
+                    message = format_meeting_tasks(tasks, meeting_title)
+                    return (message, tasks)
+                else:  # ← 추가
+                    return ("어떤 회의의 담당자를 보고 싶으신가요? 😊", [])
+                    
+            # 3. meeting_id만 있고 found_name이 없는 경우
+            elif meeting_id and not found_name:
+                # "다른 사람" 관련 질문 감지 (오타 포함)
+                suspect_patterns = [
+                    '다른', '다름', '딴', '사람', '담당', '팀원', '멤버', '누가', 
+                    '아무', '모두', '전체', '나머지', '누구', '그외', '그 외',
+                    '다른이', '다른 이', '다른애', '다른 애'
+                ]
+                
+                is_asking_others = any(w in query_lower for w in suspect_patterns)
+                
+                if is_asking_others:
+                    # 다른 사람 할일 검색 (현재 사용자 제외)
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.meeting_id = %s AND t.user_id != %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (meeting_id, user_id))  # user_id 추가!
+                    tasks = cursor.fetchall()
+
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+                    
+                    if not tasks:
+                        cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                        result = cursor.fetchone()
+                        meeting_title = result['title'] if result else None
+                        
+                        if meeting_title:
+                            return (f"네, {meeting_title}에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
+                        return ("네, 이 회의에서 다른 사람이 맡은 할 일은 없어요! 😊", [])
+                    
+                    meeting_title = tasks[0].get('meeting_title') if tasks else None
+                    message = format_meeting_tasks(tasks, meeting_title)
+                    return (message, tasks)
+                
+                else:
+                    # "저 회의에서 할일" - 전체 할일 표시
+                    query = f"""
+                        SELECT t.*, u.name as assignee_real_name, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN user u ON t.user_id = u.id
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.meeting_id = %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (meeting_id,))
+                    tasks = cursor.fetchall()
+                    
+                    action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                    tasks = merge_tasks_and_actions(list(tasks), action_items)
+
+                    # 회의 제목 추출
+                    meeting_title = tasks[0].get('meeting_title') if tasks else None
+                    if not meeting_title:
+                        cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                        result = cursor.fetchone()
+                        meeting_title = result['title'] if result else None
+                    
+                    if not tasks:
+                        if meeting_title:
+                            return (f"네, {meeting_title}에서 정한 할 일이 없어요! 😊", [])
+                        return ("네, 이 회의에서 정한 할 일이 없어요! 😊", [])
+                    
+                    message = format_meeting_tasks(tasks, meeting_title)
+                    return (message, tasks)
+                
+            # 4. "담당자 이름" 패턴 (김철수, 이영희 등)
+            else:
+                # 이름 추출 - 조사 목록을 먼저 제거
+                import re
+                
+                # 이전에 이미 found_name이 설정된 경우 (회의 대명사 + 타인 이름)
+                if 'found_name' not in locals():
+                    # 조사 제거
+                    cleaned_query = user_query
+                    josas = ['가', '이', '은', '는', '을', '를', '의', '와', '과', '에게', '한테', '께서', '님이', '님의', '님은', '님을']
+                    for josa in josas:
+                        cleaned_query = cleaned_query.replace(josa, ' ')
+                    
+                    # 한글 이름 추출 (2-4글자)
+                    # DB에서 실제 사용자 이름 목록 가져오기
+                    cursor.execute("SELECT name FROM user")
+                    all_user_names = [row['name'] for row in cursor.fetchall()]
+                    
+                    # 쿼리에서 실제 이름 찾기
+                    found_name = None
+                    for name in all_user_names:
+                        if name in user_query:
+                            found_name = name
+                            break
+                
+                if not found_name:
+                    return ("담당자 이름을 말씀해주세요! 😊", [])
+                
+                name = found_name
+
+                # meeting_id가 있고 "전체"가 없으면 특정 회의 내에서 검색
+                has_global_intent = (
+                    any(word in query_lower for word in ['전체', '모든', '전부', '전체에서', '전체적']) or
+                    ('다른' in query_lower and any(w in query_lower for w in ['회의', '일', '할일', '것']))
+                )
+                
+                if meeting_id and not has_global_intent:
+                    # 특정 회의만
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.assignee_name LIKE %s AND t.meeting_id = %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (f'%{name}%', meeting_id))
+                else:
+                    # 전체 검색
+                    query = f"""
+                        SELECT t.*, m.title as meeting_title 
+                        FROM task t
+                        LEFT JOIN meeting m ON t.meeting_id = m.id
+                        WHERE t.assignee_name LIKE %s {status_filter}
+                        ORDER BY 
+                            CASE WHEN t.due_date < CURDATE() THEN 0 ELSE 1 END,
+                            t.due_date ASC
+                        LIMIT 10
+                    """
+                    cursor.execute(query, (f'%{name}%',))
+                
+                tasks = cursor.fetchall()
+                
+                action_items = fetch_action_items(cursor, meeting_id=meeting_id, user_id=user_id, status_filter=status_filter)
+                tasks = merge_tasks_and_actions(list(tasks), action_items)
+
+                # 디버깅
+                print(f"[DEBUG] 담당자 검색: name={name}, meeting_id={meeting_id if meeting_id else 'None'}")
+                print(f"[DEBUG] 검색 결과: {len(tasks)}개")
+                if tasks:
+                    print(f"[DEBUG] 첫 번째 결과: {tasks[0]}")
+                            
+                if not tasks:
+                    if status_text:
+                        return (f"{name}님이 {status_text} 일을 찾을 수 없어요! 😊", [])
+                    return (f"{name}님이 담당한 일을 찾을 수 없어요! 😊", [])
+                
+                message = format_assignee_tasks(tasks, name, status_text)
+                return (message, tasks)
+                        
+        except Exception as e:
+            logger.error(f"Task 검색 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return ("Task 검색 중 오류가 발생했어요. 😢", [])
+    
 # ============================================================
 # Participant 검색
 # ============================================================
@@ -1861,7 +2303,7 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
                 # 회의 정보 먼저 가져오기
                 cursor.execute("""
                     SELECT title, scheduled_at 
-                    FROM Meeting 
+                    FROM meeting 
                     WHERE id = %s
                 """, (meeting_id,))
                 meeting = cursor.fetchone()
@@ -1872,8 +2314,8 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
                 # 참석자 목록 조회
                 cursor.execute("""
                     SELECT p.name, p.speaker_id, u.job
-                    FROM Participant p
-                    LEFT JOIN User u ON p.name = u.name
+                    FROM participant p
+                    LEFT JOIN user u ON p.name = u.name
                     WHERE p.meeting_id = %s
                     ORDER BY p.name
                 """, (meeting_id,))
@@ -1894,7 +2336,7 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
                 # 사용자 정보 조회
                 cursor.execute("""
                     SELECT id, name, job 
-                    FROM User 
+                    FROM user 
                     WHERE name LIKE %s
                 """, (f"%{person_name}%",))
                 user = cursor.fetchone()
@@ -1910,8 +2352,8 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
                         m.scheduled_at,
                         m.status,
                         m.description
-                    FROM Meeting m
-                    JOIN Participant p ON m.id = p.meeting_id
+                    FROM meeting m
+                    JOIN participant p ON m.id = p.meeting_id
                     WHERE p.name = %s
                     ORDER BY m.scheduled_at DESC
                     LIMIT 50
@@ -1958,10 +2400,11 @@ def search_keywords(keyword_name, user_job=None):
             
             # Keyword 테이블과 Meeting 테이블 JOIN
             query = """
-                SELECT DISTINCT m.* 
-                FROM Meeting m
-                JOIN MeetingKeyword mk ON m.id = mk.meeting_id
-                JOIN Keyword k ON mk.keyword_id = k.id
+                SELECT DISTINCT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                FROM meeting m
+                LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                JOIN meeting_result_keyword mk ON m.id = mk.meeting_id
+                JOIN keyword k ON mk.keyword_id = k.id
                 WHERE k.name LIKE %s
                 ORDER BY m.scheduled_at DESC
                 LIMIT 50
@@ -1989,7 +2432,7 @@ def search_keywords(keyword_name, user_job=None):
             
             # 여러 회의
             else:
-                detail = format_multiple_meetings_short(
+                detail, _, _ = format_multiple_meetings_short(
                     meetings[:10],
                     user_query=f"'{keyword_name}' 키워드",
                     total=len(meetings) if len(meetings) > 10 else None,
@@ -2004,3 +2447,74 @@ def search_keywords(keyword_name, user_job=None):
             import traceback
             traceback.print_exc()
             return (f"'{keyword_name}' 키워드 검색 중 오류가 발생했어요. 😢", [])
+        
+
+# ============================================================
+# Action Item 통합 검색 헬퍼
+# ============================================================
+
+def fetch_action_items(cursor, meeting_id: int = None, user_id: int = None, status_filter: str = "") -> list:
+    """Action Item 조회 - Task와 동일한 형식으로 반환"""
+    try:
+        ai_status_cond = ""
+        if "COMPLETED" in status_filter.upper() if status_filter else False:
+            ai_status_cond = "AND ai.is_completed = 1"
+        elif "TODO" in status_filter.upper() if status_filter else False:
+            ai_status_cond = "AND ai.is_completed = 0"
+        
+        if meeting_id:
+            query = f"""
+                SELECT 
+                    ai.id, ai.task as title, ai.task as description,
+                    COALESCE(u.name, '미지정') as assignee_name,
+                    ai.due_date,
+                    CASE WHEN ai.is_completed = 1 THEN 'COMPLETED' ELSE 'TODO' END as status,
+                    ai.source, m.id as meeting_id, m.title as meeting_title,
+                    'action_item' as source_table
+                FROM action_item ai
+                LEFT JOIN meeting_result mr ON ai.meeting_result_id = mr.id
+                LEFT JOIN meeting m ON mr.meeting_id = m.id
+                LEFT JOIN user u ON ai.assignee_user_id = u.id
+                WHERE m.id = %s {ai_status_cond}
+                ORDER BY ai.due_date ASC LIMIT 20
+            """
+            cursor.execute(query, (meeting_id,))
+        elif user_id:
+            query = f"""
+                SELECT 
+                    ai.id, ai.task as title, ai.task as description,
+                    COALESCE(u.name, '미지정') as assignee_name,
+                    ai.due_date,
+                    CASE WHEN ai.is_completed = 1 THEN 'COMPLETED' ELSE 'TODO' END as status,
+                    ai.source, m.id as meeting_id, m.title as meeting_title,
+                    'action_item' as source_table
+                FROM action_item ai
+                LEFT JOIN meeting_result mr ON ai.meeting_result_id = mr.id
+                LEFT JOIN meeting m ON mr.meeting_id = m.id
+                LEFT JOIN user u ON ai.assignee_user_id = u.id
+                WHERE m.host_user_id = %s {ai_status_cond}
+                ORDER BY ai.due_date ASC LIMIT 20
+            """
+            cursor.execute(query, (user_id,))
+        else:
+            return []
+        
+        return list(cursor.fetchall())
+    except Exception as e:
+        print(f"[DEBUG] Action Item 조회 실패: {e}")
+        return []
+
+
+def merge_tasks_and_actions(tasks: list, action_items: list) -> list:
+    """Task + Action Item 합치고 마감일순 정렬"""
+    for t in tasks:
+        t['source_table'] = 'task'
+    
+    combined = list(tasks) + action_items
+    
+    def sort_key(item):
+        due = item.get('due_date')
+        return (0, str(due)) if due else (1, '')
+    
+    combined.sort(key=sort_key)
+    return combined[:30]
