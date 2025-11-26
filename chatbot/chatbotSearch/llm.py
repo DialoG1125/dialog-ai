@@ -513,3 +513,141 @@ def answer_meeting_question(meeting_content: dict, question: str) -> str:
         import traceback
         traceback.print_exc()
         return "죄송해요, 답변 생성 중 오류가 발생했어요. 😢"
+    
+
+def answer_with_context(user_query: str, context: dict) -> str:
+    """
+    컨텍스트 기반 답변 생성
+    
+    Args:
+        user_query: 사용자 질문
+        context: Redis 컨텍스트 (이전 검색 결과 포함)
+    
+    Returns:
+        답변
+    """
+    from datetime import datetime
+    
+    # 컨텍스트 정보 포맷팅
+    context_info = ""
+    
+    # 이전 검색한 회의 목록
+    if context.get('meetings') or context.get('meeting_list'):
+        meetings = context.get('meetings') or context.get('meeting_list')
+        if meetings:
+            context_info += "\n[이전에 검색한 회의 목록]\n"
+            for idx, m in enumerate(meetings[:5], 1):
+                title = m.get('title', '제목 없음')
+                
+                # 날짜 포맷팅
+                date = m.get('scheduled_at', '')
+                if isinstance(date, str) and date:
+                    try:
+                        dt = datetime.fromisoformat(date.replace('Z', '+00:00'))
+                        date_str = dt.strftime('%Y년 %m월 %d일')
+                    except:
+                        date_str = date
+                else:
+                    date_str = ''
+                
+                # 상태
+                status = m.get('status', '')
+                status_kr = '예정' if status == 'SCHEDULED' else '완료' if status == 'COMPLETED' else '진행중'
+                
+                context_info += f"{idx}. {title} - {date_str} ({status_kr})\n"
+    
+    # 선택된 회의
+    elif context.get('selected_meeting_id'):
+        meeting_title = context.get('meeting_title', '알 수 없는 회의')
+        context_info += f"\n[현재 선택된 회의]\n{meeting_title}\n"
+    
+    # 프롬프트 구성
+    prompt = f"""당신은 회의록 관리 시스템의 AI 어시스턴트입니다.
+
+{context_info}
+
+사용자 질문: {user_query}
+
+위 컨텍스트를 참고하여 질문에 답변해주세요.
+
+**규칙:**
+1. 이전 검색 결과를 활용하여 답변
+2. "완료된 걸로는?"처럼 불완전한 질문도 맥락을 보고 이해
+3. 2-3문장으로 간결하게
+4. 친근한 말투 (존댓말)
+5. 컨텍스트에 없는 정보는 "더 구체적으로 질문해주세요"
+
+예시:
+질문: "완료된 걸로는?"
+이전 검색: 11월 회의 3개 (예정 2개, 완료 1개)
+답변: 11월에 완료된 회의는 "디자인 시스템 구축 회의" 1개예요! 📌 (10월 20일에 진행되었습니다)
+"""
+    
+    try:
+        response = call_hyperclova_simple(prompt)
+        return response.strip()
+    
+    except Exception as e:
+        logger.error(f"컨텍스트 기반 답변 생성 실패: {e}")
+        return "죄송해요, 답변 생성 중 오류가 발생했어요. 😢"
+
+
+def classify_query_intent(user_query: str, meeting_title: str) -> str:
+    """
+    컨텍스트가 있을 때 사용자 질문의 의도를 분류
+    
+    Args:
+        user_query: 사용자 질문
+        meeting_title: 이전에 선택한 회의 제목
+    
+    Returns:
+        "RAG" | "NEW_SEARCH" | "CONTEXT_DEPENDENT"
+    """
+    prompt = f"""사용자가 이전에 선택한 회의: "{meeting_title}"
+사용자 질문: "{user_query}"
+
+질문의 의도를 다음 중 하나로 분류하세요:
+
+1. **RAG** (선택한 회의 내용에 대한 상세 질문)
+   - 회의 내용, 결정사항, 참석자, 예산, 시간, 분위기 등을 물어보는 경우
+   - 예시: "예산이 얼마야?", "누가 참석했어?", "어떤 결정 했어?", "몇 시간 진행됐어?", "주요 내용은?", "어떤 걸로 하기로 했어?", "왜 선택했어?"
+   
+2. **NEW_SEARCH** (새로운 회의 검색)
+   - 다른 회의를 찾거나 전체 회의 목록을 요청하는 경우
+   - 예시: "다른 회의 뭐있어?", "API 회의 찾아줘", "11월 회의 보여줘", "전체 회의 목록"
+   
+3. **CONTEXT_DEPENDENT** (선택한 회의 관련 확장 질문)
+   - 할일, 담당자, 참석 여부 등 선택한 회의의 부가 정보를 물어보는 경우
+   - 예시: "내 할일은?", "다른 사람 할일은?", "누가 담당해?", "그거 맞지?"
+
+**중요 규칙:**
+- 의문사(어떤, 왜, 얼마, 어떻게, 무엇, 누가 등)로 시작하는 질문은 대부분 **RAG**
+- "회의" 키워드가 있으면서 검색 동사(뭐있어, 찾아, 보여줘)가 있으면 **NEW_SEARCH**
+- "할일", "담당", "맡은" 키워드가 있으면 **CONTEXT_DEPENDENT**
+
+답변 형식: RAG 또는 NEW_SEARCH 또는 CONTEXT_DEPENDENT (하나만 출력, 다른 설명 없이)
+"""
+    
+    try:
+        response = call_hyperclova_simple(prompt)
+        intent = response.strip().upper()
+        
+        # 유효성 검사
+        if intent in ["RAG", "NEW_SEARCH", "CONTEXT_DEPENDENT"]:
+            print(f"[LLM 의도 분류] '{user_query}' → {intent}")
+            return intent
+        else:
+            # 기본값: 질문형이면 RAG, 아니면 NEW_SEARCH
+            if user_query.strip().endswith('?') or any(user_query.endswith(e) for e in ['야', '니', '나', '까']):
+                print(f"[LLM 의도 분류 실패] 기본값 → RAG (질문형)")
+                return "RAG"
+            else:
+                print(f"[LLM 의도 분류 실패] 기본값 → NEW_SEARCH")
+                return "NEW_SEARCH"
+    
+    except Exception as e:
+        logger.error(f"의도 분류 실패: {e}")
+        # Fallback: 질문형이면 RAG
+        if user_query.strip().endswith('?') or any(user_query.endswith(e) for e in ['야', '니', '나', '까']):
+            return "RAG"
+        return "NEW_SEARCH"

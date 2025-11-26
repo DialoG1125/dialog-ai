@@ -8,14 +8,14 @@ class ChatRequest(BaseModel):
     message: str
     history: List[dict] = []
     session_id: Optional[str] = None
-    user_job: Optional[str] = 'NONE'      # ← 기본값 NONE
-    user_position: Optional[str] = 'NONE' # ← 기본값 NONE
-    user_name: str                        # ← 필수 (로그인했으므로)
+    user_job: Optional[str] = 'NONE'      # 기본값 NONE
+    user_position: Optional[str] = 'NONE' # 기본값 NONE
+    user_name: str                        # 필수 (로그인했으므로)
 
 class ChatResponse(BaseModel):
-    model_config = ConfigDict(exclude_none=True)  # [수정] None 필드 제외
+    model_config = ConfigDict(exclude_none=True)  # None 필드 제외
     
     answer: str
     source: str
-    history: Optional[List[dict]] = None  # [수정] None으로 변경
+    history: Optional[List[dict]] = None
     session_id: Optional[str] = None

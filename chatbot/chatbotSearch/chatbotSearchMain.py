@@ -37,7 +37,8 @@ from .search import (
 from .formatting import (
     format_single_meeting,
     format_single_meeting_with_persona,
-    format_multiple_meetings_short
+    format_multiple_meetings_short,
+    calculate_shown_counts
 )
 
 # 선택 처리
@@ -75,14 +76,13 @@ app.add_middleware(
 # 클라이언트 초기화
 # ============================================================
 
-# DB 연결 테스트 (서버 시작 시)
-from .database import test_db_connection
-if not test_db_connection():
-    print("[⚠️] MySQL 연결 실패 - 서버는 시작되지만 DB 기능은 작동하지 않을 수 있습니다.")
+# # DB 연결 테스트 (서버 시작 시)
+# from .database import test_db_connection
+# if not test_db_connection():
+#     print("[⚠️] MySQL 연결 실패 - 서버는 시작되지만 DB 기능은 작동하지 않을 수 있습니다.")
 
 # Redis 초기화
 redis_client = init_redis_client()
-
 
 # ============================================================
 # Phase 2-A: Template 페르소나 함수들
@@ -98,7 +98,7 @@ def get_user_id_by_name(user_name: str) -> int:
         
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT id FROM User WHERE name = %s", (user_name,))
+            cursor.execute("SELECT id FROM user WHERE name = %s", (user_name,))
             result = cursor.fetchone()
             return result['id'] if result else 1
         except Exception as e:
@@ -227,10 +227,14 @@ def handle_multiple_meetings(lambda_response: str, user_query: str,
     
     if rag_answer:
         print(f"✅ RAG 답변 생성 성공!")
-        
+
+        shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
         # ========== 컨텍스트 저장 (선택 가능하도록) ==========
         context = {
             'state': 'awaiting_selection',
+            'shown_completed': shown_completed,
+            'shown_scheduled': shown_scheduled,
             'meetings': meetings[:5],  # 상위 5개만
             'total_count': total_count,
             'original_query': user_query,
@@ -291,11 +295,11 @@ def is_detail_question(query: str, context: dict) -> bool:
         '누가', '누구', '발표자', '담당자',
         '어떻게', '방법', '과정',
         '왜', '이유', '목적',
-        '언제', '시간', '일정', '몇 분', '얼마나', '기간',  # ← 추가!
+        '언제', '시간', '일정', '몇 분', '얼마나', '기간',
         '결론', '결과', '결정',
         '내용', '주요', '핵심', '요약',
         '발표', '논의', '합의', '의견',
-        '도구', '기술', '방식', '참석자', '발언'  # ← 추가!
+        '도구', '기술', '방식', '참석자', '발언'
     ]
     
     # 제외 패턴 (다른 intent와 구분)
@@ -466,19 +470,28 @@ async def chat(request: ChatRequest):
         user_query = request.message.strip()
         user_name = request.user_name
         
+        # "나", "내", "저" → 로그인 사용자 이름으로 자동 치환
+        if any(keyword in user_query for keyword in ['할일', '할 일', 'task', 'todo', '업무']):
+            original_user_query = user_query
+            user_query = user_query.replace('나의', user_name).replace('내', user_name).replace('나', user_name).replace('저', user_name)
+            if original_user_query != user_query:
+                print(f"[자동 치환] '{original_user_query}' → '{user_query}'")
+
         # user_job/user_position 처리: NONE이 아니면 해당 값 사용, NONE이면 DB에서 조회
         user_job = request.user_job if request.user_job and request.user_job != 'NONE' else None
         user_position = request.user_position if request.user_position and request.user_position != 'NONE' else None
         
+        # user_id 먼저 조회 (항상 필요함!)
+        user_id = get_user_id_by_name(user_name)
+
         # DB에서 사용자 정보 조회 (직무/직급이 NONE일 때만)
         if not user_job or not user_position:
-            user_id = get_user_id_by_name(user_name)
             from .database import get_db_connection
             
             with get_db_connection() as conn:
                 if conn:
                     cursor = conn.cursor()
-                    cursor.execute("SELECT job, position FROM User WHERE id = %s", (user_id,))
+                    cursor.execute("SELECT job, position FROM user WHERE id = %s", (user_id,))
                     user_data = cursor.fetchone()
                     cursor.close()
                     
@@ -516,8 +529,8 @@ async def chat(request: ChatRequest):
         original_query = user_query
         context = get_context(session_id)
         intent = None
-        llm_analysis = None  # ← 이 줄 추가!
-        
+        llm_analysis = None
+
         # ========== 0차: Task 질문 최우선 체크 ==========
         # 이름 재사용 조건 먼저 체크
         name_reuse_condition = False
@@ -527,14 +540,20 @@ async def chat(request: ChatRequest):
             if pronoun_detected:
                 name_reuse_condition = True
         
+        # ========== 0차: Task 질문 최우선 체크 ==========
         is_task_query_preliminary = (
             ('일' in user_query and any(kw in user_query for kw in ['맡은', '담당', '완료', '끝난', '남은', '해야'])) or
             any(pattern in user_query.lower() for pattern in ['task', '액션', '할일', '할 일']) or
+            any(pattern in user_query for pattern in ['해야될', '해야할', '해야되는', '해야하는', '해야 될', '해야 되는', '남은', '미완료', 'todo']) or
             (context and context.get('selected_meeting_id') and
             any(ref in user_query for ref in ['저 회의', '그 회의', '회의안에서', '회의에서', '거기']) and
             any(task_word in user_query for task_word in ['일', '할일', '담당', '맡은', 'task'])) or
             (context and context.get('state') == 'meeting_selected' and 
             user_query.strip() in ['나는?', '나는', '내꺼는?', '내꺼는', '내가?', '내가']) or
+            (context and context.get('state') == 'meeting_selected' and
+            any(word in user_query for word in ['전원', '모두', '전부']) and
+            '회의' not in user_query and
+            len(user_query) < 15) or
             name_reuse_condition
         )
                 
@@ -559,22 +578,17 @@ async def chat(request: ChatRequest):
                     ]
                 )
             
-            # 2. 나머지 요청 (여기서 처리하지 않고 아래로 넘김)
-            more_keywords = ['나머지', '더', '추가', '남은', '다른']
-            if not any(keyword in user_query for keyword in more_keywords):
-                # 나머지 요청이 아니면 일반 검색으로
-                pass
-                meeting_count = len(context.get('meeting_list', []))
-                
-                return ChatResponse(
-                    answer=f"네, 맞아요! 총 {meeting_count}개의 회의예요. 😊\n\n더 자세히 알고 싶은 회의가 있으면 번호나 제목을 알려주세요!",
-                    source="confirmation",
-                    session_id=session_id,
-                    history=request.history + [
-                        {"role": "user", "content": user_query},
-                        {"role": "assistant", "content": f"네, 맞아요! 총 {meeting_count}개의 회의예요. 😊"}
-                    ]
-                )
+            # 2. 페이지네이션 요청 (나머지/더)
+            more_keywords = ['나머지', '나머지도', '남은', '남은거', '더', '더보기', '더보여', 
+                            '더있어', '더줘', '더알려', '추가', '추가로', '계속', '이어서', 
+                            '다음', '또', '그외', '줘봐', '줘', '보여줘']
+            
+            if any(keyword in user_query for keyword in more_keywords):
+                print(f"[DEBUG] meeting_list_shown 상태에서 페이지네이션 요청")
+                # 상태를 awaiting_selection으로 변경하고 아래 로직으로 넘김
+                context['state'] = 'awaiting_selection'
+                save_context(session_id, context)
+                # 아래 awaiting_selection 처리로 넘어감
         
         # ========== 번호 선택 우선 체크 ==========
         elif (context and context.get('state') == 'awaiting_selection' and 
@@ -790,9 +804,14 @@ async def chat(request: ChatRequest):
                                     meeting_copy[key] = value
                             meetings_serializable.append(meeting_copy)
                         
+                        shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
                         context = {
                             'state': 'awaiting_selection',
+                            'shown_completed': shown_completed,
+                            'shown_scheduled': shown_scheduled,
                             'meetings': meetings_serializable[:10],
+                            'offset': min(5, len(meetings_serializable[:10])),
                             'total_count': len(results),
                             'original_query': user_query
                         }
@@ -853,6 +872,7 @@ async def chat(request: ChatRequest):
         is_task_query = (
             ('일' in user_query and any(kw in user_query for kw in ['맡은', '담당', '완료', '끝난', '남은', '해야'])) or
             any(pattern in user_query.lower() for pattern in ['task', '액션', '할일', '할 일']) or
+            any(pattern in user_query for pattern in ['해야될', '해야할', '해야되는', '해야하는', '해야 될', '해야 되는', '남은', '미완료', 'todo']) or    
             (context and context.get('state') == 'meeting_selected' and 
             ('사람' in user_query or '담당' in user_query or '누가' in user_query or '아무도' in user_query)) or
             ('전체' in user_query or '모두' in user_query or '전부' in user_query) or
@@ -866,10 +886,39 @@ async def chat(request: ChatRequest):
             detect_pronoun_meeting_reference(user_query))
         )
 
+        # # 컨텍스트에 회의가 있으면 해당 회의의 Task만 조회
+        # context = get_context(session_id)
+        # if context and context.get('selected_meeting_id'):
+        #     meeting_id = context['selected_meeting_id']
+        #     print(f"[컨텍스트] 회의 ID={meeting_id}의 Task 조회")
+            
+        #     from .search import search_tasks
+        #     message, tasks = search_tasks(
+        #         user_query=user_query,
+        #         user_id=user_id,
+        #         meeting_id=meeting_id,
+        #         user_name=user_name
+        #     )
+            
+        #     print(f"[DEBUG] Task 검색 완료, meeting_id={meeting_id}")
+            
+        #     return ChatResponse(
+        #         answer=message,
+        #         source="task_query",
+        #         session_id=session_id
+        #     )
+        
         if is_task_query:
             print(f"[DEBUG] Task 질문 감지")
             
             from .search import search_tasks
+            
+            # 컨텍스트에서 meeting_id 가져오기 (전체 키워드 없을 때만)
+            meeting_id_from_context = None
+            if context and context.get('selected_meeting_id'):
+                if not any(keyword in user_query for keyword in ['전체', '모든', '전부', '다른 회의']):
+                    meeting_id_from_context = context['selected_meeting_id']
+                    print(f"[컨텍스트] 회의 ID={meeting_id_from_context}의 Task 조회")
             
             # "X 회의에서 할일" 패턴 감지
             has_meeting_context_in_query = (
@@ -918,7 +967,10 @@ async def chat(request: ChatRequest):
                         else:
                             print(f"[DEBUG] '{meeting_query}' 회의를 찾을 수 없음")
 
-            # 컨텍스트에서 meeting_id 가져오기 (위에서 못 찾았을 때만)
+            # 컨텍스트 우선 사용
+            if not meeting_id:
+                meeting_id = meeting_id_from_context
+            
             if not meeting_id and context and context.get('selected_meeting_id'):
                 meeting_id = context['selected_meeting_id']
                 
@@ -927,37 +979,23 @@ async def chat(request: ChatRequest):
                     meeting_id = None
                     print(f"[DEBUG] '{user_query}' - 전체 검색 키워드 감지, meeting_id 초기화")
 
-            # user_name으로 user_id 조회 (로그인 필수이므로 user_name은 항상 존재)
-            try:
-                import mysql.connector
-                from .config import DB_CONFIG
-                conn = mysql.connector.connect(**DB_CONFIG)
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute("SELECT id FROM User WHERE name = %s", (user_name,))
-                result = cursor.fetchone()
-                cursor.fetchall()  # ← 남은 결과 비우기!
-                if not result:
-                    raise Exception(f"사용자를 찾을 수 없습니다: {user_name}")
-                user_id = result['id']
-                cursor.close()
-                conn.close()
-                print(f"[DEBUG] user_id 조회 성공: {user_id}")
-            except Exception as e:
-                print(f"[ERROR] user_id 조회 실패: {e}")
-                raise Exception("로그인 정보를 확인할 수 없습니다.")
+            # 기존 함수 사용!
+            user_id = get_user_id_by_name(user_name)
+            print(f"[DEBUG] user_id 조회 성공: {user_id}")
 
             # 타인 이름 목록 DB에서 조회
-            import mysql.connector
             from .config import DB_CONFIG
 
             try:
-                conn = mysql.connector.connect(**DB_CONFIG)
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute("SELECT name FROM User WHERE id != %s", (user_id,))
-                other_names = [row['name'] for row in cursor.fetchall()]
-                cursor.close()
-                conn.close()
-                print(f"[DEBUG] DB에서 타인 이름 조회: {other_names}")
+                with get_db_connection() as conn:
+                    if conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name FROM user WHERE id != %s", (user_id,))
+                        other_names = [row['name'] for row in cursor.fetchall()]
+                        cursor.close()
+                        print(f"[DEBUG] DB에서 타인 이름 조회: {other_names}")
+                    else:
+                        other_names = []
             except Exception as e:
                 print(f"[DEBUG] 타인 이름 조회 실패: {e}")
                 other_names = []
@@ -996,31 +1034,32 @@ async def chat(request: ChatRequest):
                 try:
                     print(f"[DEBUG] 컨텍스트 저장 시도: meeting_id={meeting_id}")
                     
-                    conn = init_db_connection()
-                    print(f"[DEBUG] DB 연결 타입: {type(conn)}")
+                    from .database import get_db_connection
                     
-                    if conn and conn is not True:
-                        cursor = conn.cursor(dictionary=True)
-                        cursor.execute("SELECT title FROM Meeting WHERE id = %s", (meeting_id,))
-                        meeting = cursor.fetchone()
-                        cursor.close()
-                        conn.close()
-                        
-                        if meeting:
-                            # 기존 컨텍스트 가져와서 업데이트
-                            existing_context = get_context(session_id) or {}
-                            existing_context.update({
-                                'state': 'meeting_selected',
-                                'selected_meeting_id': meeting_id,
-                                'meeting_title': meeting['title'],
-                            })
-                            save_context(session_id, existing_context)
-                            print(f"[DEBUG] ✅ 컨텍스트 저장 성공: meeting_id={meeting_id}, title={meeting['title']}")
-                        else:
-                            print(f"[DEBUG] ❌ 회의 정보 조회 실패: meeting_id={meeting_id}")
-                    else:
-                        print(f"[DEBUG] ❌ DB 연결 실패 또는 bool 반환: {conn}")
-                        
+                    with get_db_connection() as conn:
+                        if conn:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT title FROM meeting WHERE id = %s", (meeting_id,))
+                            meeting = cursor.fetchone()
+                            cursor.close()
+                            
+                            if meeting:
+                                # 기존 컨텍스트 가져와서 업데이트
+                                existing_context = get_context(session_id) or {}
+                                
+                                # ← fetchone() 결과가 튜플이므로 인덱스로 접근
+                                title = meeting[0] if isinstance(meeting, tuple) else meeting.get('title')
+                                
+                                existing_context.update({
+                                    'state': 'meeting_selected',
+                                    'selected_meeting_id': meeting_id,
+                                    'meeting_title': title,
+                                })
+                                save_context(session_id, existing_context)
+                                print(f"[DEBUG] ✅ 컨텍스트 저장 성공: meeting_id={meeting_id}, title={title}")
+                            else:
+                                print(f"[DEBUG] ❌ 회의 정보 조회 실패: meeting_id={meeting_id}")
+                                
                 except Exception as e:
                     print(f"[DEBUG] ❌ 컨텍스트 저장 중 예외 발생: {e}")
                     import traceback
@@ -1039,13 +1078,27 @@ async def chat(request: ChatRequest):
             )
         
         # ========== RAG 상세 질문 처리 ==========
-        if (intent == 'meeting_detail_rag' or 
-            (context and context.get('state') == 'meeting_selected' and 
-            not is_count_question(user_query) and
-            intent not in ['task_search', 'participant_search', 'keyword_search', 'meeting_search', 'meeting_select', 'confirmation', None])):
+        # 회의 선택 후 상세 질문 (예산, 참여자, 시간 등)
+        # RAG 질문 판단: 키워드 1차 체크 → LLM 2차 확인
+        detail_keywords = ['예산', '얼마', '금액', '비용', '언제', '시간', '몇 시', '어떻게', '어떤', '왜', '방법', '결과', '결론', '내용', '주요', '핵심', '이유', '목적']
+        is_detail_question = any(keyword in user_query for keyword in detail_keywords)
+        
+        # LLM으로 한 번 더 확인 (키워드로 못 잡은 경우)
+        if (context and context.get('state') == 'meeting_selected' and 
+            not is_detail_question):
+            from .llm import classify_query_intent
+            meeting_title = context.get('meeting_title', '')
+            llm_intent = classify_query_intent(user_query, meeting_title)
+            if llm_intent == "RAG":
+                is_detail_question = True
+                print(f"[LLM 보강] RAG 질문으로 재분류")
+
+        if (context and context.get('state') == 'meeting_selected' and 
+            is_detail_question and
+            intent not in ['task_search', 'participant_search', 'meeting_search']):
             
-            print(f"[DEBUG] RAG 상세 질문 처리 (intent={intent})")
-                    
+            print(f"[DEBUG] RAG 상세 질문 처리: '{user_query}'")
+
             selected_meeting_id = context.get('selected_meeting_id')
             meeting_title = context.get('meeting_title', '선택된 회의')
             
@@ -1067,21 +1120,22 @@ async def chat(request: ChatRequest):
                     cursor = conn.cursor()
                     cursor.execute("""
                         SELECT 
-                        m.id, 
-                        m.title, 
-                        m.description, 
-                        m.scheduled_at, 
-                        m.summary, 
-                        m.status,
-                        GROUP_CONCAT(
-                            CONCAT(t.speaker_name, ': ', t.text) 
-                            ORDER BY t.timestamp_seconds 
-                            SEPARATOR '\n'
-                        ) as transcript_text
-                    FROM Meeting m
-                    LEFT JOIN Transcript t ON m.id = t.meeting_id
-                    WHERE m.id = %s
-                    GROUP BY m.id
+                            m.id, 
+                            m.title, 
+                            m.description, 
+                            m.scheduled_at, 
+                            mr.summary, 
+                            m.status,
+                            GROUP_CONCAT(
+                                CONCAT(t.speaker_name, ': ', t.text) 
+                                ORDER BY t.sequence_order 
+                                SEPARATOR '\n'
+                            ) as transcript_text
+                        FROM meeting m
+                        LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                        LEFT JOIN transcript t ON m.id = t.meeting_id
+                        WHERE m.id = %s
+                        GROUP BY m.id
                     """, (selected_meeting_id,))
                     meeting = cursor.fetchone()
                     cursor.close()
@@ -1123,6 +1177,48 @@ async def chat(request: ChatRequest):
 
             # 할일/Task 관련 표현 (컨텍스트 활용 대상)
             task_refs = ['내가', '나의', '할일', '할 일', '담당', '맡은', '누가', '다른 사람']
+            # RAG 상세 질문 키워드 (확장하면 안 됨)
+            detail_keywords = ['예산', '얼마', '금액', '비용', '언제', '시간', '몇 시', '어떻게', '어떤', '왜', '방법', '결과', '결론', '내용', '주요', '핵심', '이유', '목적', '참석자', '참여자', '발표자', '분위기', '반응', '의견', '어땠', '어떻']
+            is_detail_question = any(keyword in user_query for keyword in detail_keywords)
+
+            # 키워드로 못 잡으면 LLM으로 한 번 더 체크
+            if not is_detail_question:
+                from .llm import classify_query_intent
+                intent = classify_query_intent(user_query, selected_meeting_title)
+                if intent == "RAG":
+                    is_detail_question = True
+                    print(f"[LLM 보강] RAG 질문으로 재분류")
+
+            if context and context.get('state') == 'meeting_selected':
+                selected_meeting_id = context.get('selected_meeting_id')
+                selected_meeting_title = context.get('meeting_title', '')
+                
+                print(f"[컨텍스트] 이전 선택 회의: {selected_meeting_title} (ID: {selected_meeting_id})")
+                
+                # 🔹 LLM으로 의도 분류
+                from .llm import classify_query_intent
+                intent = classify_query_intent(user_query, selected_meeting_title)
+                
+                if intent == "RAG":
+                    # RAG 상세 질문 → 컨텍스트 유지, 확장 안 함
+                    print(f"[LLM 의도] RAG 질문 → 컨텍스트 유지")
+                    # selected_meeting_id 유지하여 1055번 줄 RAG 처리로 진행
+                    
+                elif intent == "NEW_SEARCH":
+                    # 새로운 검색 → 컨텍스트 삭제
+                    print(f"[LLM 의도] 새로운 검색 → 컨텍스트 삭제")
+                    context = None
+                    selected_meeting_id = None
+                    selected_meeting_title = None
+                    delete_context(session_id)
+                    
+                elif intent == "CONTEXT_DEPENDENT":
+                    # 컨텍스트 확장 (할일, 담당자 등)
+                    if not is_count_check:  # COUNT 질문은 확장 안 함
+                        user_query = f"{selected_meeting_title} 회의에서 {user_query}"
+                        print(f"[LLM 의도] 컨텍스트 확장: {user_query}")
+                    else:
+                        print(f"[LLM 의도] CONTEXT_DEPENDENT이지만 COUNT 질문 → 확장 안 함")
 
             # 명확한 컨텍스트 참조가 있으면 무조건 컨텍스트 활용
             has_context_ref = any(ref in user_query for ref in context_refs)
@@ -1136,13 +1232,13 @@ async def chat(request: ChatRequest):
             # 1. is_context_dependent_query가 True면 기본적으로 컨텍스트 활용
             # 2. 단, 명확한 새 검색 패턴만 제외
                         
-            # 명확한 새 검색 패턴: "회의" + 검색동사
+            # 명확한 새 검색 패턴: "회의" + 검색동사 (단, RAG 질문 제외)
             explicit_new_search_patterns = [
-                ('회의' in user_query and '뭐' in user_query),  # "회의 뭐있어"
-                ('회의' in user_query and '어떤' in user_query),  # "어떤 회의"
-                ('회의' in user_query and any(w in user_query for w in ['있어', '있었어', '있나'])),  # "회의 있어?"
-                ('회의' in user_query and any(w in user_query for w in ['찾아', '검색'])),  # "회의 찾아줘"
-                (user_query.count('회의') >= 2),  # "기획 회의", "마케팅 회의" 등 (회의 단어가 2번 이상)
+                ('회의' in user_query and '뭐' in user_query and not is_detail_question),
+                ('회의' in user_query and '어떤' in user_query and not is_detail_question),
+                ('회의' in user_query and any(w in user_query for w in ['있어', '있었어', '있나']) and not is_detail_question),
+                ('회의' in user_query and any(w in user_query for w in ['찾아', '검색']) and not is_detail_question),
+                (user_query.count('회의') >= 2),
             ]
 
             # 전체 검색 명시 패턴 (컨텍스트 무시)
@@ -1181,13 +1277,16 @@ async def chat(request: ChatRequest):
                 (is_context_dependent_query(user_query) or is_confirmation) and 
                 not explicit_new_search and
                 not wants_global_search and
-                not is_count_check  # ← COUNT 질문은 컨텍스트 확장 안 함
+                not is_count_check and  # ← COUNT 질문은 컨텍스트 확장 안 함
+                not is_detail_question  # ← RAG 상세 질문도 확장 안 함
             )
 
             if should_use_context:
                 user_query = f"{selected_meeting_title} 회의에서 {user_query}"
                 print(f"[컨텍스트 확장] {original_query} → {user_query}")
-                
+            elif is_detail_question:
+                print(f"[RAG 질문] 컨텍스트 확장 안 함: {user_query}")
+
             else:
                 if wants_global_search:
                     print(f"[컨텍스트] 전체 검색 요청 → 컨텍스트 무시")
@@ -1196,6 +1295,7 @@ async def chat(request: ChatRequest):
                     # COUNT 질문은 컨텍스트는 유지하되 확장하지 않음
                 else:
                     print(f"[컨텍스트] 새로운 검색 → 컨텍스트 무시")
+                    context = None
                     selected_meeting_id = None  # 컨텍스트 필터 해제
                     selected_meeting_title = None
                     delete_context(session_id)  # 컨텍스트 삭제
@@ -1220,7 +1320,7 @@ async def chat(request: ChatRequest):
             date_info = parse_date_from_query(user_query)
             status = parse_status_from_query(user_query)
             
-            # 컨텍스트에서 이전 검색 상태 가져오기 (새로 추가!)
+            # 컨텍스트에서 이전 검색 상태 가져오기
             if not status and context and context.get('search_status'):
                 status = context.get('search_status')
                 print(f"[DEBUG] 컨텍스트에서 상태 복원: {status}")
@@ -1237,13 +1337,20 @@ async def chat(request: ChatRequest):
                         print(f"[DEBUG] 통계 질문 + 과거형 어미 → COMPLETED로 처리")
                         break
             
-            # 키워드는 실제 명사만 (불용어 + 동사 제거)
-            keywords = extract_keywords_from_query(user_query)
+            # 일반적인 회의 목록 요청 패턴 체크
+            general_list_patterns = ['회의 뭐', '회의 있', '회의 목록', '회의 보여', '회의 알려', '무슨 회의']
+            is_general_request = any(p in user_query for p in general_list_patterns) and not date_info.get('type')
+            
+            if is_general_request:
+                print("[DEBUG] 일반 회의 목록 요청으로 판단 → 키워드 검색 생략")
+                keywords = []  # 키워드 없이 전체 검색
+            else:
+                keywords = extract_keywords_from_query(user_query)
             excluded_for_count = [
-                '했어', '했니', '했나', '했냐', '있어', '있었어', '몇', '개', '번', '횟수',  # ← 횟수 추가!
+                '했어', '했니', '했나', '했냐', '있어', '있었어', '몇', '개', '번', '횟수',
                 # 종결어미 추가
                 '개야', '번이야', '거야', '거니', '이야', '예요', '이에요',
-                '뭐야', '뭔가', '뭐지', '인가', '인지', '인데', '네요', '추가', '알려'  # ← 알려 추가!
+                '뭐야', '뭔가', '뭐지', '인가', '인지', '인데', '네요', '추가', '알려'
             ]
             
             keywords = [k for k in keywords if k not in excluded_for_count]
@@ -1321,7 +1428,7 @@ async def chat(request: ChatRequest):
                         # 날짜 포맷 변경: (2025년 01월 20일) 형식
                         date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
                         title = meeting.get('title', '제목 없음')
-                        answer += f"{i}. {title} {date_str}\n"  # ← 순서 바꿈!
+                        answer += f"{i}. {title} {date_str}\n"
                     
                     if count > 5:
                         answer += f"\n💡 이 외에도 {count - 5}개가 더 있어요!"
@@ -1330,7 +1437,7 @@ async def chat(request: ChatRequest):
                 if meetings and count > 0:
                     # datetime → str 변환 (전체 회의 저장!)
                     meetings_serializable = []
-                    for meeting in meetings:  # ← [:10] 제거! 전체 저장!
+                    for meeting in meetings:
                         meeting_copy = {}
                         for key, value in meeting.items():
                             if isinstance(value, datetime):
@@ -1341,7 +1448,7 @@ async def chat(request: ChatRequest):
                     
                     context_data = {
                         'state': 'count_result',
-                        'meetings': meetings_serializable,  # 전체 저장!
+                        'meetings': meetings_serializable,
                         'total_count': count,
                         'original_query': user_query
                     }
@@ -1370,7 +1477,7 @@ async def chat(request: ChatRequest):
 
         # ========== LLM 전처리 (오타 보정 + 의도 파악) ==========
         # 컨텍스트 의존적이거나 짧은 질문일 때 LLM 분석 실행
-        preprocessed = None  # ← 무조건 초기화!
+        preprocessed = None  # 무조건 초기화
 
         # 명확한 패턴이 아닐 때만 LLM 분석
         if not is_obvious_pattern(user_query) and needs_llm_analysis(user_query, context):
@@ -1567,10 +1674,15 @@ async def chat(request: ChatRequest):
                                 else:
                                     meeting_copy[key] = value
                             meetings_serializable.append(meeting_copy)
-                        
+                            
+                        shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
                         context = {
                             'state': 'awaiting_selection',
+                            'shown_completed': shown_completed,
+                            'shown_scheduled': shown_scheduled,
                             'meetings': meetings_serializable[:10],
+                            'offset': min(5, len(meetings_serializable[:10])),
                             'total_count': len(results),
                             'original_query': user_query
                         }
@@ -1601,7 +1713,7 @@ async def chat(request: ChatRequest):
                         session_id=session_id
                     )
                 
-            # 3. 회의 상세 질문 (RAG) - keyword_search보다 먼저!
+            # 3. 회의 상세 질문 (RAG) - keyword_search보다 먼저
             if is_detail_question(user_query, context):
                 print(f"[DEBUG] 회의 상세 질문 감지 (RAG)")
                 
@@ -1631,15 +1743,16 @@ async def chat(request: ChatRequest):
                                 m.title, 
                                 m.description, 
                                 m.scheduled_at, 
-                                m.summary, 
+                                mr.summary, 
                                 m.status,
                                 GROUP_CONCAT(
                                     CONCAT(t.speaker_name, ': ', t.text) 
-                                    ORDER BY t.timestamp_seconds 
+                                    ORDER BY t.sequence_order 
                                     SEPARATOR '\n'
                                 ) as transcript_text
-                            FROM Meeting m
-                            LEFT JOIN Transcript t ON m.id = t.meeting_id
+                            FROM meeting m
+                            LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                            LEFT JOIN transcript t ON m.id = t.meeting_id
                             WHERE m.id = %s
                             GROUP BY m.id
                         """, (selected_meeting_id,))
@@ -1733,9 +1846,14 @@ async def chat(request: ChatRequest):
                                     meeting_copy[key] = value
                             meetings_serializable.append(meeting_copy)
                         
+                        shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
                         save_context(session_id, {
                             'state': 'awaiting_selection',
+                            'shown_completed': shown_completed,
+                            'shown_scheduled': shown_scheduled,
                             'meetings': meetings_serializable[:10],
+                            'offset': min(5, len(meetings_serializable[:10])),
                             'total_count': len(meetings)
                         })
                         print(f"[DEBUG] 여러 회의 컨텍스트 저장: {len(meetings)}개")
@@ -1834,8 +1952,12 @@ async def chat(request: ChatRequest):
                                 meeting_copy[key] = value
                         meetings_serializable.append(meeting_copy)
                     
+                    shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+                    
                     save_context(session_id, {
                         'state': 'awaiting_selection',
+                        'shown_completed': shown_completed,
+                        'shown_scheduled': shown_scheduled,
                         'last_query': user_query,
                         'meetings': meetings_serializable
                     })
@@ -1962,9 +2084,14 @@ async def chat(request: ChatRequest):
                                     meeting_copy[key] = value
                             meetings_serializable.append(meeting_copy)
                         
+                        shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
                         context = {
                             'state': 'awaiting_selection',
+                            'shown_completed': shown_completed,
+                            'shown_scheduled': shown_scheduled,
                             'meetings': meetings_serializable[:10],
+                            'offset': min(5, len(meetings_serializable[:10])),
                             'total_count': len(results),
                             'original_query': user_query
                         }
@@ -2018,11 +2145,67 @@ async def chat(request: ChatRequest):
 
         # ========== 기존 레거시 패턴 매칭 (LLM 처리 안 된 경우만) ==========
 
+        # ========== RAG 상세 질문 우선 처리 ==========
+        detail_keywords = ['예산', '얼마', '금액', '비용', '언제', '시간', '몇 시', '어떻게', '왜', '방법', '결과', '결론', '내용', '주요', '핵심', '이유', '목적', '참석자', '참여자', '발표자', '분위기', '반응', '의견', '어땠', '어떻']
+        is_detail_question_early = any(keyword in user_query for keyword in detail_keywords)
+        
+        if (context and context.get('state') == 'meeting_selected' and 
+            is_detail_question_early and
+            not any(keyword in user_query for keyword in ['할일', '할 일', 'task', '담당', '맡은'])):
+            
+            print(f"[DEBUG] RAG 상세 질문 우선 처리: '{user_query}'")
+            
+            selected_meeting_id = context.get('selected_meeting_id')
+            
+            from .database import get_db_connection
+            
+            with get_db_connection() as conn:
+                if conn:
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT 
+                                m.id, 
+                                m.title, 
+                                m.description, 
+                                m.scheduled_at, 
+                                mr.summary, 
+                                m.status,
+                                GROUP_CONCAT(
+                                    CONCAT(t.speaker_name, ': ', t.text) 
+                                    ORDER BY t.sequence_order 
+                                    SEPARATOR '\n'
+                                ) as transcript_text
+                            FROM meeting m
+                            LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                            LEFT JOIN transcript t ON m.id = t.meeting_id
+                            WHERE m.id = %s
+                            GROUP BY m.id
+                        """, (selected_meeting_id,))
+                        meeting = cursor.fetchone()
+                        cursor.close()
+                        
+                        if meeting:
+                            from .llm import answer_meeting_question
+                            rag_answer = answer_meeting_question(meeting, user_query)
+                            
+                            return ChatResponse(
+                                answer=rag_answer,
+                                history=request.history + [
+                                    {"role": "user", "content": original_query},
+                                    {"role": "assistant", "content": rag_answer}
+                                ],
+                                source="meeting_detail_rag",
+                                session_id=session_id
+                            )
+                    except Exception as e:
+                        logger.error(f"RAG 처리 오류: {e}")
+
         # [0-2단계] Task 질문 체크
         # 컨텍스트 기반 Task 질문 감지
         previous_was_task = False
         previous_was_meeting_detail = False
-        previous_meeting_id = None  # ← 추가!
+        previous_meeting_id = None  
 
         if request.history and len(request.history) >= 2:
             last_response = request.history[-1].get('content', '') if request.history[-1].get('role') == 'assistant' else ''
@@ -2060,7 +2243,7 @@ async def chat(request: ChatRequest):
         # 1-1. "이 회의", "그 회의", "저 회의" + Task 단어 (명시적)
         meeting_id_from_meeting_ref = None
         if any(word in user_query for word in ['이 회의', '그 회의', '저 회의', '해당 회의']):
-            if any(kw in user_query for kw in ['할', '맡', '담당', '일', '해야', 'task', '사람', '누가', '누구']):  # ← 추가!
+            if any(kw in user_query for kw in ['할', '맡', '담당', '일', '해야', 'task', '사람', '누가', '누구']):  
                 if context and context.get('selected_meeting_id'):
                     is_task_question = True
                     meeting_id_from_meeting_ref = context['selected_meeting_id']
@@ -2068,11 +2251,11 @@ async def chat(request: ChatRequest):
 
         # 1-2. 이전이 회의 상세 + 짧은 질문 + Task 관련 단어
         if not is_clear_new_query and previous_was_meeting_detail and len(user_query) <= 15:
-            if any(kw in user_query for kw in ['할', '맡', '담당', '일', '해야', '사람', '누가', '누구']):  # ← 추가!
+            if any(kw in user_query for kw in ['할', '맡', '담당', '일', '해야', '사람', '누가', '누구']):  
                 is_task_question = True
                 print(f"[DEBUG] 암묵적 Task 질문 감지 (이전: 회의 상세)")
 
-        # 1-3. 이전이 Task + 짧은 질문 + "다른 사람" 패턴 (추가!)
+        # 1-3. 이전이 Task + 짧은 질문 + "다른 사람" 패턴
         if not is_clear_new_query and previous_was_task and len(user_query) <= 15:
             if any(word in user_query for word in ['다른', '누가', '누구', '사람']):
                 is_task_question = True
@@ -2094,7 +2277,7 @@ async def chat(request: ChatRequest):
         # 4. 컨텍스트에 meeting_id 있음 + 회의 범위 지정 + Task 단어
         elif not is_clear_new_query and context and context.get('selected_meeting_id') and len(user_query) <= 20:
             has_meeting_ref = any(word in user_query for word in ['저기', '거기', '안에서', '에서', '저', '그'])
-            has_task_word = any(word in user_query for word in ['할', '일', '맡', '담당', '해야', 'task', '사람', '누가', '누구'])  # ← 추가!
+            has_task_word = any(word in user_query for word in ['할', '일', '맡', '담당', '해야', 'task', '사람', '누가', '누구'])  
             
             if has_meeting_ref and has_task_word:
                 is_task_question = True
@@ -2107,9 +2290,9 @@ async def chat(request: ChatRequest):
             
             # "전체" 키워드가 있으면 meeting_id 무시
             meeting_id = None
-            if not is_asking_all_tasks:  # ← 추가!
+            if not is_asking_all_tasks:  
                 # 컨텍스트에서 selected_meeting_id 확인
-                meeting_id = meeting_id_from_meeting_ref  # 우선 사용!
+                meeting_id = meeting_id_from_meeting_ref
                 if not meeting_id and context and context.get('selected_meeting_id'):
                     meeting_id = context['selected_meeting_id']
             
@@ -2133,36 +2316,98 @@ async def chat(request: ChatRequest):
         should_use_context = False
 
         if context and context.get('state') == 'awaiting_selection':
-            # 명확한 선택 패턴 체크
-            selection_patterns = [
-                r'^\d+$',  # 숫자만
-                r'^\d+번$',  # 1번, 2번
-                r'^(첫|마지막)',  # 첫 번째, 마지막
-            ]
-            
-            is_clear_selection = any(re.match(p, user_query.strip()) for p in selection_patterns)
-            
-            # 새로운 검색 의도 체크
-            search_keywords = ['찾아', '검색', '알려', '보여', '회의', '미팅', '있어', '있었', '있나']
-            has_search_word = any(kw in user_query for kw in search_keywords)
-            
-            # 날짜 정보 체크
+            # 먼저 날짜 정보 체크!
             date_info_check = parse_date_from_query(user_query)
             has_date_info = date_info_check.get('type') is not None
             
-            # 판단: "나머지"는 특별 처리
-            if any(word in user_query.lower() for word in ['나머지', '더', '더보기', '추가', '계속']):
-                should_use_context = False  # 컨텍스트는 유지하되, handle_selection으로 안 넘김
-                print(f"[DEBUG] '나머지' 요청 감지 → 특별 처리")
-            elif is_clear_selection:
-                should_use_context = True
-                print(f"[DEBUG] 선택 의도 감지 → 컨텍스트 사용")
-            else:
-                # 새로운 검색으로 처리
+            # 날짜 정보가 있으면 무조건 새 검색
+            if has_date_info:
                 should_use_context = False
                 delete_context(session_id)
-                print(f"[DEBUG] 새로운 검색 의도 감지 → 컨텍스트 무시")
+                context = None
+                print(f"[DEBUG] 날짜 정보 감지 ({date_info_check.get('original')}) → 새로운 검색")
+            else:
+                # 명확한 선택 패턴 체크
+                selection_patterns = [
+                    r'^\d+$',  # 숫자만
+                    r'^\d+번$',  # 1번, 2번
+                    r'^(첫|마지막)',  # 첫 번째, 마지막
+                ]
                 
+                is_clear_selection = any(re.match(p, user_query.strip()) for p in selection_patterns)
+                
+                # 새로운 검색 의도 체크
+                search_keywords = ['찾아', '검색', '알려', '보여', '회의', '미팅', '있어', '있었', '있나']
+                has_search_word = any(kw in user_query for kw in search_keywords)
+                
+                # 판단: "나머지"는 특별 처리
+                if any(word in user_query.lower() for word in ['나머지', '더', '더보기', '추가', '계속']):
+                    should_use_context = False  # 컨텍스트는 유지하되, handle_selection으로 안 넘김
+                    print(f"[DEBUG] '나머지' 요청 감지 → 특별 처리")
+                elif is_clear_selection:
+                    should_use_context = True
+                    print(f"[DEBUG] 선택 의도 감지 → 컨텍스트 사용")
+                else:
+                    # 새로운 검색으로 처리
+                    should_use_context = False
+                    delete_context(session_id)
+                    print(f"[DEBUG] 새로운 검색 의도 감지 → 컨텍스트 무시")
+                    
+        # ========== 후속 질문 처리 (LLM 활용) ==========
+        elif context and not is_obvious_pattern(user_query):
+            # "나머지" 요청 감지 (정규식 + 오타 허용)
+            query_lower = user_query.lower().replace(' ', '')  # 띄어쓰기 제거
+            
+            pagination_patterns = [
+                r'나머.*',
+                r'남은.*',
+                r'더.*[보줘있알려]',
+                r'추가.*',
+                r'계속|이어서|다음',
+                r'또.*[있뭐어]',
+                r'그\s*외',
+                r'더\s*[보줘]',
+                r'완료.*나머',
+                r'완료.*더',
+                r'예정.*나머',
+                r'예정.*더'
+            ]
+            
+            # 오타 허용 키워드
+            fuzzy_pagination = ['나머', '남머', '나미', '너머', '더보', '더줘', '더있', '더알', '추가로', '계속', '이어']
+            
+            is_pagination = (
+                any(re.search(pattern, query_lower) for pattern in pagination_patterns) or
+                any(fuzzy in query_lower for fuzzy in fuzzy_pagination)
+            )
+            
+            # ========== 상태 키워드 체크 (새 검색) ==========
+            status_keywords = ['완료된', '예정된', '진행중', '취소된']
+            is_status_only = user_query.strip() in status_keywords  # "완료된"만 입력
+            
+            # 검색 의도가 명확하지 않고 짧은 질문 (단, 페이지네이션/상태 키워드 아닐 때만)
+            if not is_pagination and not is_status_only and len(user_query) < 20 and not any(w in user_query for w in ['찾아', '검색', '회의', '뭐있어']):
+                print(f"[DEBUG] 후속 질문 가능성 → LLM으로 확인")
+                
+                from .llm import answer_with_context
+                llm_answer = answer_with_context(user_query, context)
+                
+                return ChatResponse(
+                    answer=llm_answer,
+                    history=request.history + [
+                        {"role": "user", "content": original_query},
+                        {"role": "assistant", "content": llm_answer}
+                    ],
+                    source="context_followup",
+                    session_id=session_id
+                )
+            elif is_pagination:
+                print(f"[DEBUG] 페이지네이션 요청 감지 → awaiting_selection 처리로 이동")
+            elif is_status_only:
+                print(f"[DEBUG] 상태 키워드만 입력 → 새 검색으로 처리")
+                delete_context(session_id)
+                # 아래 MySQL 검색으로 진행
+
         # === 컨텍스트 기반 선택 처리 ===
         if should_use_context and context.get('state') == 'awaiting_selection':
             print(f"[DEBUG] 컨텍스트 내 선택 처리: {user_query}")
@@ -2180,34 +2425,98 @@ async def chat(request: ChatRequest):
                 selected_number = int(user_query.strip())
                 print(f"[DEBUG] 번호 선택: {selected_number}번")
                 
-                if 1 <= selected_number <= len(meetings):
-                    selected_meeting = meetings[selected_number - 1]
-                    answer = format_single_meeting_with_persona(selected_meeting, user_job)
-                    
-                    return ChatResponse(
-                        answer=answer,
-                        history=request.history + [
-                            {"role": "user", "content": user_query},
-                            {"role": "assistant", "content": answer}
-                        ],
-                        source="meeting_selection_by_number",
-                        session_id=session_id
-                    )
+                shown_completed = context.get('shown_completed', 3)
+                shown_scheduled = context.get('shown_scheduled', 3)
+                
+                # 번호 → 회의 매핑
+                if 1 <= selected_number <= shown_completed:
+                    # 완료된 회의 선택
+                    completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+                    selected_meeting = completed_meetings[selected_number - 1]
+                    print(f"[DEBUG] 완료된 회의 선택: {selected_number}번 → {selected_meeting.get('title')}")
+                
+                elif shown_completed < selected_number <= (shown_completed + shown_scheduled):
+                    # 예정된 회의 선택
+                    scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+                    scheduled_index = selected_number - shown_completed - 1
+                    selected_meeting = scheduled_meetings[scheduled_index]
+                    print(f"[DEBUG] 예정된 회의 선택: {selected_number}번 → {selected_meeting.get('title')}")
+                
+                # ========== 상태 없이 숫자만 입력 ==========
                 else:
-                    answer = f"❌ {selected_number}번은 없어요!\n\n"
-                    answer += f"1번부터 {len(meetings)}번까지 선택할 수 있어요. 😊"
+                    # 완료/예정 둘 다 해당 번호 있는지 체크
+                    has_completed = 1 <= selected_number <= shown_completed
+                    has_scheduled = 1 <= selected_number <= shown_scheduled
                     
-                    return ChatResponse(
-                        answer=answer,
-                        history=request.history,
-                        source="invalid_number",
-                        session_id=session_id
-                    )
-            
+                    if has_completed and has_scheduled:
+
+                        # 명확화 질문
+                        context['last_source'] = 'ambiguous_number'
+                        context['last_ambiguous_number'] = selected_number
+                        save_context(session_id, context)
+                        
+                        # 둘 다 있음 → 명확화 질문
+                        return ChatResponse(
+                            answer=f"완료된 회의와 예정된 회의 모두 {selected_number}번이 있어요! 🤔\n\n어떤 회의를 보시겠어요?\n\n💬 \"완료 {selected_number}\" - 완료된 {selected_number}번 회의\n💬 \"예정 {selected_number}\" - 예정된 {selected_number}번 회의",
+                            source="ambiguous_number",
+                            session_id=session_id
+                        )
+                    
+                    elif has_completed:
+                        # 완료만 있음
+                        completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+                        selected_meeting = completed_meetings[selected_number - 1]
+                        print(f"[DEBUG] 완료 {selected_number}번 선택 (자동): {selected_meeting.get('title')}")
+                    
+                    elif has_scheduled:
+                        # 예정만 있음
+                        scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+                        scheduled_index = selected_number - shown_completed - 1
+                        selected_meeting = scheduled_meetings[scheduled_index]
+                        print(f"[DEBUG] 예정 {selected_number}번 선택 (자동): {selected_meeting.get('title')}")
+                    
+                    else:
+                        # 둘 다 없음
+                        total_shown = shown_completed + shown_scheduled
+                        return ChatResponse(
+                            answer=f"❌ {selected_number}번은 없어요!\n\n완료: 1~{shown_completed}번\n예정: 1~{shown_scheduled}번\n중에서 선택해주세요! 😊",
+                            source="invalid_number",
+                            session_id=session_id
+                        )
+
+                # 페르소나 템플릿 적용
+                answer = format_single_meeting_with_persona(selected_meeting, user_job_normalized)
+
+                return ChatResponse(
+                    answer=answer,
+                    history=request.history + [
+                        {"role": "user", "content": user_query},
+                        {"role": "assistant", "content": answer}
+                    ],
+                    source="meeting_selection_by_number",
+                    session_id=session_id
+)
+                        
             # ========== 1. "나머지", "더" 요청 감지 (오타 허용) ==========
-            more_keywords = ['나머지', '더', '추가', '남은', '다른', '또', '그 외', '외']
-            wants_more = any(keyword in user_query for keyword in more_keywords)
-            
+            more_keywords = ['나머지', '나머지도', '남은', '남은거', '더', '더보기', '더보여', 
+                            '더있어', '더줘', '더알려', '추가', '추가로', '계속', '이어서', 
+                            '다음', '다른', '또', '그외', '외', '그밖', '더있나', '더있니', 
+                            '또뭐', '또있어', '나머', '남머', '나미', '더보']
+
+            more_patterns = [
+                r'나머.*',
+                r'남은.*',
+                r'더.*[보줘있알려]',
+                r'추가.*',
+                r'계속|이어서|다음',
+                r'또.*[있뭐어]',
+                r'그\s*외',
+                r'더\s*[보줘]'
+            ]
+
+            wants_more = any(keyword in user_query for keyword in more_keywords) or \
+                        any(re.search(pattern, user_query) for pattern in more_patterns)
+
             # 오타 허용 (부분 매칭)
             if not wants_more:
                 fuzzy_more = ['나머', '남머', '나미', '너머', '더보', '더줘', '더있', '더알', '추가']
@@ -2234,7 +2543,7 @@ async def chat(request: ChatRequest):
                 last_shown_index = context.get('last_shown_index', 5)  # 기본값: 5개까지 봄
                 
                 # 요청한 개수 파싱 (기본값: 5개씩)
-                requested_count = 5  # 기본값
+                requested_count = 5
                 if number_match:
                     requested_count = int(number_match.group(1))
                 elif korean_match:
@@ -2294,11 +2603,11 @@ async def chat(request: ChatRequest):
                     answer += "✅ 모든 회의를 보여드렸어요!\n\n"
                 
                 answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
-                answer += f"예: 번호({start_idx + 1}, {start_idx + 2}), 날짜(10월 20일), 제목(디자인 회의) 😊"
+                answer += f"예: 번호({start_idx + 1}, {start_idx + 2}), 제목(디자인 회의) 😊"
                 
                 # ========== 컨텍스트 업데이트 (진행 상황 저장) ==========
                 context['state'] = 'awaiting_selection'
-                context['last_shown_index'] = end_idx  # 어디까지 봤는지 저장!
+                context['last_shown_index'] = end_idx  # 어디까지 봤는지 저장
                 save_context(session_id, context)
                 
                 return ChatResponse(
@@ -2327,7 +2636,7 @@ async def chat(request: ChatRequest):
                         print(f"[DEBUG] Phase 2-A (통계 결과): {user_job_normalized} 관련도 순으로 정렬")
                     
                     # 여러 회의 포맷으로 보여주기
-                    answer = format_multiple_meetings_short(
+                    answer, shown_completed, shown_scheduled = format_multiple_meetings_short(
                         meetings[:10],
                         user_query,
                         total_count if total_count > 10 else None,
@@ -2336,7 +2645,7 @@ async def chat(request: ChatRequest):
                     )
                     
                     # ========== 컨텍스트를 awaiting_selection으로 변경 ==========
-                    # datetime → str 변환 (정렬된 meetings 사용!)
+                    # datetime → str 변환 (정렬된 meetings 사용)
                     meetings_serializable = []
                     for meeting in meetings[:10]:
                         meeting_copy = {}
@@ -2348,7 +2657,7 @@ async def chat(request: ChatRequest):
                         meetings_serializable.append(meeting_copy)
                     
                     context['state'] = 'awaiting_selection'
-                    context['meetings'] = meetings_serializable  # ← 정렬된 결과로 업데이트!
+                    context['meetings'] = meetings_serializable  # 정렬된 결과로 업데이트
                     save_context(session_id, context)
                     
                     return ChatResponse(
@@ -2370,165 +2679,531 @@ async def chat(request: ChatRequest):
             meetings = context.get('meetings', [])
             
             if meetings:
-                # ========== 0-1. 숫자만 입력 (번호 선택) ==========
-                # "5", "10", "3" 같은 순수 숫자만 입력한 경우
-                if user_query.strip().isdigit():
-                    selected_number = int(user_query.strip())
-                    print(f"[DEBUG] 번호 선택: {selected_number}번")
+                # ========== 0-0. 상태 필터링 ("완료", "예정" 단독 입력) ==========
+                status_filter_keywords = {
+                    '완료': 'COMPLETED',
+                    '완료된': 'COMPLETED', 
+                    '예정': 'SCHEDULED',
+                    '예정된': 'SCHEDULED'
+                }
+
+                # 명확화 질문 직후인지 체크
+                last_source = context.get('last_source')
+                print(f"[DEBUG] last_source: {last_source}, last_number: {context.get('last_ambiguous_number')}")
+                if last_source == 'ambiguous_number' and user_query.strip() in ['완료', '예정']:
+                    # "완료" 또는 "예정"만 입력 시 → 이전 번호 재사용
+                    last_number = context.get('last_ambiguous_number')
+                    if last_number:
+                        user_query = f"{user_query} {last_number}"
+                        print(f"[DEBUG] 명확화 질문 직후 → 쿼리 확장: {user_query}")
+                        
+                # ========== 쿼리 확장 적용 후 다시 체크 ==========
+                query_to_check = user_query.strip()  # 확장된 쿼리 사용
+
+                if query_to_check in status_filter_keywords:
+                    target_status = status_filter_keywords[query_to_check]
+                    print(f"[DEBUG] 상태 필터링 요청: {target_status}")
+
+                    # 해당 상태의 회의만 필터링
+                    filtered_meetings = [m for m in meetings if m.get('status') == target_status]
                     
-                    # 범위 체크
-                    if 1 <= selected_number <= len(meetings):
-                        selected_meeting = meetings[selected_number - 1]
-                        
-                        # 페르소나 템플릿 적용
-                        answer = format_single_meeting_with_persona(selected_meeting, user_job)
-                        
+                    if not filtered_meetings:
+                        status_name = "완료된" if target_status == 'COMPLETED' else "예정된"
                         return ChatResponse(
-                            answer=answer,
-                            history=request.history + [
-                                {"role": "user", "content": user_query},
-                                {"role": "assistant", "content": answer}
-                            ],
-                            source="meeting_selection_by_number",
+                            answer=f"❌ {status_name} 회의가 없어요!",
+                            source='no_meetings_with_status',
                             session_id=session_id
                         )
+                    
+                    # 기존 shown 값 가져오기
+                    if target_status == 'COMPLETED':
+                        current_offset = context.get('shown_completed', 0)
                     else:
-                        answer = f"❌ {selected_number}번은 없어요!\n\n"
-                        answer += f"1번부터 {len(meetings)}번까지 선택할 수 있어요. 😊"
-                        
-                        return ChatResponse(
-                            answer=answer,
-                            history=request.history,
-                            source="invalid_number",
-                            session_id=session_id
-                        )
-                
-                # ========== 0-2. "나머지", "더" 요청 감지 ==========
-                more_keywords = ['나머지', '더', '추가', '남은', '다른', '또', '그 외', '외']
-                wants_more = any(keyword in user_query for keyword in more_keywords)
-                
-                # 오타 허용
-                if not wants_more:
-                    fuzzy_more = ['나머', '남머', '나미', '너머', '더보', '더줘', '더있', '더알']
-                    if any(x in user_query for x in fuzzy_more):
-                        wants_more = True
-                        print(f"[DEBUG] 유사 단어 감지 (오타 허용)")
-                
-                # 숫자 패턴 감지
-                number_match = re.search(r'(\d+)개', user_query)
-                korean_numbers = {'한': 1, '두': 2, '세': 3, '네': 4, '다섯': 5, '여섯': 6, '일곱': 7, '여덟': 8, '아홉': 9, '열': 10}
-                korean_match = None
-                for korean, num in korean_numbers.items():
-                    if korean in user_query and '개' in user_query:
-                        korean_match = num
-                        break
-                
-                if number_match or korean_match or '몇개' in user_query:
-                    wants_more = True
-                
-                if wants_more:
-                    print(f"[DEBUG] 나머지 회의 요청: '{user_query}'")
+                        current_offset = context.get('shown_scheduled', 0)
                     
-                    # ========== 현재 어디까지 보여줬는지 추적 ==========
-                    last_shown_index = context.get('last_shown_index', 5)
-                    total_count = context.get('total_count', len(meetings))
+                    # 오프셋 기준으로 다음 배치 가져오기
+                    remaining_meetings = filtered_meetings[current_offset:]
                     
-                    # 💡 여기가 문제: meetings는 10개만 저장됐는데 total_count는 21개
-                    # meetings 길이로 체크해야 함
-                    if last_shown_index >= len(meetings):
-                        answer = "더 이상 회의가 없어요! 😊\n\n저장된 회의를 모두 보여드렸습니다."
-                        return ChatResponse(
-                            answer=answer,
-                            history=request.history,
-                            source="no_more_meetings",
-                            session_id=session_id
-                        )
-                    
-                    # 요청한 개수 파싱 (기본값: 5개씩)
-                    requested_count = 5
-                    if number_match:
-                        requested_count = int(number_match.group(1))
-                    elif korean_match:
-                        requested_count = korean_match
-                    
-                    # 다음 범위 계산
-                    start_idx = last_shown_index
-                    end_idx = min(start_idx + requested_count, len(meetings))
-
-                    remaining_meetings = meetings[start_idx:end_idx]
-
                     if not remaining_meetings:
-                        # 저장된 건 다 봤지만, 실제로는 더 있을 수 있음
-                        total_count = context.get('total_count', len(meetings))
-                        if len(meetings) < total_count:
-                            answer = f"저장된 {len(meetings)}개 회의를 모두 보여드렸어요!\n\n"
-                            answer += f"💡 실제로는 총 {total_count}개의 회의가 있습니다.\n"
-                            answer += "더 보시려면 구체적인 키워드나 날짜로 검색해주세요!"
-                        else:
-                            answer = "더 이상 회의가 없어요! 😊\n\n이미 모든 회의를 보여드렸습니다."
-                        
+                        status_name = "완료된" if target_status == 'COMPLETED' else "예정된"
                         return ChatResponse(
-                            answer=answer,
-                            history=request.history,
-                            source="no_more_meetings",
+                            answer=f"✅ {status_name} 회의를 모두 보여드렸어요! 😊",
+                            source='no_more_with_status',
                             session_id=session_id
                         )
                     
-                    # ========== 상세 포맷으로 보여주기 ==========
-                    answer = f"나머지 회의들이에요! 📋\n\n"
+                    # 다음 5개 (또는 남은 개수)
+                    next_batch = remaining_meetings[:5]
+                    start_number = current_offset + 1
                     
-                    for i, meeting in enumerate(remaining_meetings):
-                        actual_number = start_idx + i + 1
-                        emoji = f"📌 {actual_number}."
-                        
-                        title = meeting.get('title', '제목 없음')
+                    answer = f"나머지 {'완료된' if target_status == 'COMPLETED' else '예정된'} 회의예요! 📋\n\n"
+
+                    for i, meeting in enumerate(next_batch):
+                        actual_number = start_number + i
                         
                         scheduled_at = meeting.get('scheduled_at')
                         if isinstance(scheduled_at, str):
                             scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
-                        date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
                         
-                        # summary 또는 description
+                        date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+                        title = meeting.get('title', '제목 없음')
+                        
                         summary = meeting.get('summary', '')
                         if not summary or summary.strip() == '':
                             summary = meeting.get('description', '내용 없음')
                         
-                        # 1-2문장 (80자)
                         lines = summary.split('.')[:2]
                         display_text = '. '.join([line.strip() for line in lines if line.strip()])
                         if len(display_text) > 80:
                             display_text = display_text[:80] + "..."
                         
-                        answer += f"{emoji} {title} {date_str}\n"
+                        answer += f" 📌 {actual_number}. {title} {date_str}\n"
                         answer += f"   - {display_text}\n\n"
                     
                     # 남은 개수 계산
-                    shown_total = end_idx
-                    remaining_count = context.get('total_count', len(meetings)) - shown_total  # total_count 사용!
-
+                    total_shown = current_offset + len(next_batch)
+                    remaining_count = len(filtered_meetings) - total_shown
+                    
                     if remaining_count > 0:
-                        answer += f"💡 이 외에도 {remaining_count}개가 더 있어요!\n"
-                        answer += "\"더 보여줘\" 또는 \"나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
+                        answer += f"💡 {remaining_count}개가 더 있어요!\n"
+                        answer += f"\"{'완료된' if target_status == 'COMPLETED' else '예정된'} 나머지\" 또는 \"나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
                     else:
-                        answer += "✅ 저장된 회의를 모두 보여드렸어요!\n\n"
-                    
+                        answer += "✅ 모든 회의를 보여드렸어요!\n\n"
+
                     answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
-                    answer += f"예: 번호({start_idx + 1}, {start_idx + 2}), 날짜 😊"
+                    answer += f"예: 번호({start_number}, {start_number+1}), 날짜, 제목 😊"
                     
-                    # ========== 컨텍스트 업데이트 ==========
-                    context['last_shown_index'] = end_idx
+                    # 컨텍스트 업데이트
+                    if target_status == 'COMPLETED':
+                        context['shown_completed'] = total_shown
+                    else:
+                        context['shown_scheduled'] = total_shown
+                    
                     save_context(session_id, context)
                     
+                    return ChatResponse(
+                        answer=answer,
+                        source='status_filter_in_context',
+                        session_id=session_id
+                    )
+                
+                # ========== 0-1. 번호 선택 ==========
+                # "완료 2", "예정 2", "2" 패턴 감지
+                number_pattern = r'(?:(완료|예정)\s*)?(\d+)'
+                number_match = re.match(number_pattern, user_query.strip())
+
+                if number_match:
+                    status_prefix = number_match.group(1)  # "완료" 또는 "예정" 또는 None
+                    selected_number = int(number_match.group(2))
+                    
+                    completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+                    scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+                    
+                    shown_completed = context.get('shown_completed', 3)
+                    shown_scheduled = context.get('shown_scheduled', 3)
+                    
+                    # ========== 상태 명시된 경우 ==========
+                    if status_prefix == '완료':
+                        if 1 <= selected_number <= shown_completed:
+                            selected_meeting = completed_meetings[selected_number - 1]
+                            print(f"[DEBUG] 완료 {selected_number}번 선택: {selected_meeting.get('title')}")
+                        else:
+                            return ChatResponse(
+                                answer=f"❌ 완료 {selected_number}번은 없어요!\n완료 1번부터 {shown_completed}번까지 선택할 수 있어요. 😊",
+                                source="invalid_number",
+                                session_id=session_id
+                            )
+                    
+                    elif status_prefix == '예정':
+                        if 1 <= selected_number <= shown_scheduled:
+                            selected_meeting = scheduled_meetings[selected_number - 1]
+                            print(f"[DEBUG] 예정 {selected_number}번 선택: {selected_meeting.get('title')}")
+                        else:
+                            return ChatResponse(
+                                answer=f"❌ 예정 {selected_number}번은 없어요!\n예정 1번부터 {shown_scheduled}번까지 선택할 수 있어요. 😊",
+                                source="invalid_number",
+                                session_id=session_id
+                            )
+                    
+                    # ========== 상태 없이 숫자만 입력 ==========
+                    else:
+                        # 완료/예정 둘 다 해당 번호 있는지 체크
+                        has_completed = 1 <= selected_number <= shown_completed
+                        has_scheduled = 1 <= selected_number <= shown_scheduled
+                        
+                        if has_completed and has_scheduled:
+
+                            # 명확화 질문
+                            context['last_source'] = 'ambiguous_number'
+                            context['last_ambiguous_number'] = selected_number
+                            save_context(session_id, context)
+
+                            # 둘 다 있음 → 명확화 질문
+                            return ChatResponse(
+                                answer=f"완료된 회의와 예정된 회의 모두 {selected_number}번이 있어요! 🤔\n\n어떤 회의를 보시겠어요?\n\n💬 \"완료 {selected_number}\" - 완료된 {selected_number}번 회의\n💬 \"예정 {selected_number}\" - 예정된 {selected_number}번 회의",
+                                source="ambiguous_number",
+                                session_id=session_id
+                            )
+                        
+                        elif has_completed:
+                            # 완료만 있음
+                            selected_meeting = completed_meetings[selected_number - 1]
+                            print(f"[DEBUG] 완료 {selected_number}번 선택 (자동): {selected_meeting.get('title')}")
+                        
+                        elif has_scheduled:
+                            # 예정만 있음
+                            selected_meeting = scheduled_meetings[selected_number - 1]
+                            print(f"[DEBUG] 예정 {selected_number}번 선택 (자동): {selected_meeting.get('title')}")
+                        
+                        else:
+                            # 둘 다 없음
+                            return ChatResponse(
+                                answer=f"❌ {selected_number}번은 없어요!\n\n완료: 1~{shown_completed}번\n예정: 1~{shown_scheduled}번\n중에서 선택해주세요! 😊",
+                                source="invalid_number",
+                                session_id=session_id
+                            )
+                    
+                    # 페르소나 템플릿 적용
+                    answer = format_single_meeting_with_persona(selected_meeting, user_job_normalized)
+
+                    # 컨텍스트 저장
+                    new_context = {
+                        'state': 'meeting_selected',
+                        'selected_meeting_id': selected_meeting['id'],
+                        'meeting_title': selected_meeting.get('title', ''),
+                        'meetings': context.get('meetings', []),
+                        'shown_completed': context.get('shown_completed', 3),
+                        'shown_scheduled': context.get('shown_scheduled', 3),
+                    }
+                    save_context(session_id, new_context)
+
                     return ChatResponse(
                         answer=answer,
                         history=request.history + [
                             {"role": "user", "content": user_query},
                             {"role": "assistant", "content": answer}
                         ],
-                        source="remaining_meetings",
+                        source="meeting_selection_by_number",
                         session_id=session_id
                     )
                 
+                # ========== 0-2. "나머지", "더" 요청 감지 (완료/예정 분리 + 정규식) ==========
+                query_lower = user_query.lower().replace(' ', '')  # 띄어쓰기 제거
+
+                # 1. 완료된 회의 나머지 요청 (정규식 + 오타 허용)
+                completed_patterns = [
+                    r'완료.*나머',
+                    r'완료.*더',
+                    r'완료.*추가',
+                    r'완료.*남',
+                ]
+
+                if any(re.search(pattern, query_lower) for pattern in completed_patterns):
+                    print(f"[DEBUG] 완료된 회의 나머지 요청")
+                    
+                    completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+                    shown_completed = context.get('shown_completed', 3)
+                    remaining = completed_meetings[shown_completed:]
+                    
+                    if not remaining:
+                        return ChatResponse(
+                            answer="✅ 완료된 회의를 모두 보여드렸어요! 😊",
+                            source='no_more_completed',
+                            session_id=session_id
+                        )
+                    
+                    next_batch = remaining[:5]
+                    answer = "나머지 완료된 회의예요! 📋\n\n"
+                    
+                    # ========== 완료된 회의만 표시, 번호는 shown_completed + 1부터 ==========
+                    start_number = shown_completed + 1
+                    
+                    for i, meeting in enumerate(next_batch):
+                        actual_number = start_number + i  # 4, 5, 6, 7, 8
+                        
+                        scheduled_at = meeting.get('scheduled_at')
+                        if isinstance(scheduled_at, str):
+                            scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+                        
+                        date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+                        title = meeting.get('title', '제목 없음')
+                        
+                        summary = meeting.get('summary', '')
+                        if not summary or summary.strip() == '':
+                            summary = meeting.get('description', '내용 없음')
+                        
+                        lines = summary.split('.')[:2]
+                        display_text = '. '.join([line.strip() for line in lines if line.strip()])
+                        if len(display_text) > 80:
+                            display_text = display_text[:80] + "..."
+                        
+                        answer += f"📌 {actual_number}. {title} {date_str}\n"
+                        answer += f"   - {display_text}\n\n"
+                    
+                    total_shown = shown_completed + len(next_batch)
+                    remaining_count = len(completed_meetings) - total_shown
+                    
+                    if remaining_count > 0:
+                        answer += f"💡 완료된 회의가 {remaining_count}개 더 있어요!\n"
+                        answer += "\"완료된 나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
+                    else:
+                        answer += "✅ 완료된 회의를 모두 보여드렸어요!\n\n"
+                    
+                    answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
+                    answer += f"예: 번호({start_number}, {start_number+1}), 날짜, 제목 😊"
+                    
+                    # 컨텍스트 업데이트
+                    context['shown_completed'] = total_shown
+                    save_context(session_id, context)
+                    
+                    return ChatResponse(
+                        answer=answer,
+                        source='more_completed_meetings',
+                        session_id=session_id
+                    )
+
+                # 2. 예정된 회의 나머지 요청 (정규식 + 오타 허용)
+                scheduled_patterns = [
+                    r'예정.*나머',
+                    r'예정.*더',
+                    r'예정.*추가',
+                    r'예정.*남',
+                ]
+
+                if any(re.search(pattern, query_lower) for pattern in scheduled_patterns):
+                    print(f"[DEBUG] 예정된 회의 나머지 요청")
+                    
+                    scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+                    shown_scheduled = context.get('shown_scheduled', 3)
+                    remaining = scheduled_meetings[shown_scheduled:]
+                    
+                    if not remaining:
+                        return ChatResponse(
+                            answer="✅ 예정된 회의를 모두 보여드렸어요! 😊",
+                            source='no_more_scheduled',
+                            session_id=session_id
+                        )
+                    
+                    next_batch = remaining[:5]
+                    answer = "나머지 예정된 회의예요! 📋\n\n"
+                    
+                    # ========== 예정된 회의만 표시, 번호는 shown_scheduled + 1부터 ==========
+                    start_number = shown_scheduled + 1
+                    
+                    for i, meeting in enumerate(next_batch):
+                        actual_number = start_number + i  # 4, 5, 6, 7, 8
+                        
+                        scheduled_at = meeting.get('scheduled_at')
+                        if isinstance(scheduled_at, str):
+                            scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+                        
+                        date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+                        title = meeting.get('title', '제목 없음')
+                        
+                        summary = meeting.get('summary', '')
+                        if not summary or summary.strip() == '':
+                            summary = meeting.get('description', '내용 없음')
+                        
+                        lines = summary.split('.')[:2]
+                        display_text = '. '.join([line.strip() for line in lines if line.strip()])
+                        if len(display_text) > 80:
+                            display_text = display_text[:80] + "..."
+                        
+                        answer += f"📌 {actual_number}. {title} {date_str}\n"
+                        answer += f"   - {display_text}\n\n"
+                    
+                    total_shown = shown_scheduled + len(next_batch)
+                    remaining_count = len(scheduled_meetings) - total_shown
+                    
+                    if remaining_count > 0:
+                        answer += f"💡 예정된 회의가 {remaining_count}개 더 있어요!\n"
+                        answer += "\"예정된 나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
+                    else:
+                        answer += "✅ 예정된 회의를 모두 보여드렸어요!\n\n"
+                    
+                    answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
+                    answer += f"예: 번호({start_number}, {start_number+1}), 날짜, 제목 😊"
+                    
+                    # 컨텍스트 업데이트
+                    context['shown_scheduled'] = total_shown
+                    save_context(session_id, context)
+                    
+                    return ChatResponse(
+                        answer=answer,
+                        source='more_scheduled_meetings',
+                        session_id=session_id
+                    )
+
+                # 3. 일반 "나머지" - 키워드 + 정규식 + 오타 허용
+                more_keywords = ['나머지', '나머지도', '남은', '남은거', '더', '더보기', '더보여', 
+                                '더있어', '더줘', '더알려', '추가', '추가로', '계속', '이어서', 
+                                '다음', '또', '그외', '외', '그밖', '더있나', '더있니', 
+                                '또뭐', '또있어', '나머', '남머', '나미', '더보']
+
+                more_patterns = [
+                    r'나머.*',
+                    r'남은.*',
+                    r'더.*[보줘있알려]',
+                    r'추가.*',
+                    r'계속|이어서|다음',
+                    r'또.*[있뭐어]',
+                    r'그\s*외',
+                    r'더\s*[보줘]'
+                ]
+
+                wants_more = any(keyword in user_query for keyword in more_keywords) or \
+                            any(re.search(pattern, user_query) for pattern in more_patterns)
+
+                # 오타 허용 (띄어쓰기 제거 버전에서도 체크)
+                if not wants_more:
+                    fuzzy_more = ['나머', '남머', '나미', '너머', '더보', '더줘', '더있', '더알']
+                    if any(x in query_lower for x in fuzzy_more):
+                        wants_more = True
+                        print(f"[DEBUG] 유사 단어 감지 (오타 허용)")
+
+                if wants_more:
+                    print(f"[DEBUG] 일반 '나머지' 요청")
+                    
+                    completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+                    scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+                    
+                    shown_completed = context.get('shown_completed', 3)
+                    shown_scheduled = context.get('shown_scheduled', 3)
+                    
+                    has_more_completed = len(completed_meetings) > shown_completed
+                    has_more_scheduled = len(scheduled_meetings) > shown_scheduled
+                    
+                    # ========== 둘 다 나머지 있음 → 선택 요청 ==========
+                    if has_more_completed and has_more_scheduled:
+                        answer = "완료된 회의와 예정된 회의 모두 나머지가 있어요! 😊\n\n"
+                        answer += "어떤 회의를 더 보시겠어요?\n\n"
+                        answer += "💬 \"완료된 나머지\" - 완료된 회의 계속 보기\n"
+                        answer += "💬 \"예정된 나머지\" - 예정된 회의 계속 보기"
+                        
+                        return ChatResponse(
+                            answer=answer,
+                            source='both_have_more',
+                            session_id=session_id
+                        )
+                    
+                    # ========== 완료된 회의만 나머지 있음 → 자동 표시 ==========
+                    elif has_more_completed:
+                        print(f"[DEBUG] 완료된 회의만 나머지 있음 → 자동 표시")
+                        
+                        remaining = completed_meetings[shown_completed:]
+                        next_batch = remaining[:5]
+                        
+                        # 시작 번호 계산: 완료 shown + 1
+                        start_number = shown_completed + 1
+                        
+                        answer = "나머지 완료된 회의예요! 📋\n\n"
+                        
+                        for i, meeting in enumerate(next_batch):
+                            actual_number = start_number + i
+                            
+                            scheduled_at = meeting.get('scheduled_at')
+                            if isinstance(scheduled_at, str):
+                                scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+                            
+                            date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+                            title = meeting.get('title', '제목 없음')
+                            
+                            summary = meeting.get('summary', '')
+                            if not summary or summary.strip() == '':
+                                summary = meeting.get('description', '내용 없음')
+                            
+                            lines = summary.split('.')[:2]
+                            display_text = '. '.join([line.strip() for line in lines if line.strip()])
+                            if len(display_text) > 80:
+                                display_text = display_text[:80] + "..."
+                            
+                            answer += f"📌 {actual_number}. {title} {date_str}\n"
+                            answer += f"   - {display_text}\n\n"
+                        
+                        total_shown = shown_completed + len(next_batch)
+                        remaining_count = len(completed_meetings) - total_shown
+                        
+                        if remaining_count > 0:
+                            answer += f"💡 완료된 회의가 {remaining_count}개 더 있어요!\n"
+                            answer += "\"나머지\" 또는 \"완료된 나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
+                        else:
+                            answer += "✅ 완료된 회의를 모두 보여드렸어요!\n\n"
+                        
+                        answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
+                        answer += f"예: 번호({start_number}, {start_number+1}), 날짜, 제목 😊"
+                        
+                        context['shown_completed'] = total_shown
+                        save_context(session_id, context)
+                        
+                        return ChatResponse(
+                            answer=answer,
+                            source='auto_more_completed',
+                            session_id=session_id
+                        )
+                        
+                    # ========== 예정된 회의만 나머지 있음 → 자동 표시 ==========
+                    elif has_more_scheduled:
+                        print(f"[DEBUG] 예정된 회의만 나머지 있음 → 자동 표시")
+                        
+                        remaining = scheduled_meetings[shown_scheduled:]
+                        next_batch = remaining[:5]
+                        
+                        # 시작 번호 계산: 완료 전체 + 예정 shown + 1
+                        start_number = shown_scheduled + 1
+
+                        answer = "나머지 예정된 회의예요! 📋\n\n"
+                        
+                        for i, meeting in enumerate(next_batch):
+                            actual_number = start_number + i
+                            
+                            scheduled_at = meeting.get('scheduled_at')
+                            if isinstance(scheduled_at, str):
+                                scheduled_at = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+                            
+                            date_str = scheduled_at.strftime('(%Y년 %m월 %d일)') if scheduled_at else ''
+                            title = meeting.get('title', '제목 없음')
+                            
+                            summary = meeting.get('summary', '')
+                            if not summary or summary.strip() == '':
+                                summary = meeting.get('description', '내용 없음')
+                            
+                            lines = summary.split('.')[:2]
+                            display_text = '. '.join([line.strip() for line in lines if line.strip()])
+                            if len(display_text) > 80:
+                                display_text = display_text[:80] + "..."
+                            
+                            answer += f"📌 {actual_number}. {title} {date_str}\n"
+                            answer += f"   - {display_text}\n\n"
+                        
+                        total_shown = shown_scheduled + len(next_batch)
+                        remaining_count = len(scheduled_meetings) - total_shown
+                        
+                        if remaining_count > 0:
+                            answer += f"💡 예정된 회의가 {remaining_count}개 더 있어요!\n"
+                            answer += "\"나머지\" 또는 \"예정된 나머지\" 라고 하시면 계속 볼 수 있어요.\n\n"
+                        else:
+                            answer += "✅ 예정된 회의를 모두 보여드렸어요!\n\n"
+                        
+                        answer += "더 자세히 알고 싶은 회의를 선택해주세요!\n"
+                        answer += f"예: 번호({start_number}, {start_number+1}), 날짜, 제목 😊"
+                        
+                        context['shown_scheduled'] = total_shown
+                        save_context(session_id, context)
+                        
+                        return ChatResponse(
+                            answer=answer,
+                            source='auto_more_scheduled',
+                            session_id=session_id
+                        )
+                    
+                    # ========== 둘 다 나머지 없음 ==========
+                    else:
+                        return ChatResponse(
+                            answer="✅ 모든 회의를 보여드렸어요! 😊",
+                            source='no_more_any',
+                            session_id=session_id
+                        )
+    
         # ========== 1. 상태 키워드 감지 ==========
             if meetings:
                 # ========== "나머지" 요청 먼저 체크 ==========
@@ -2598,17 +3273,25 @@ async def chat(request: ChatRequest):
                     best_match_score = 0
                     for meeting in meetings:
                         title = meeting.get('title', '').lower()
-                        description = meeting.get('description', '').lower()
+                        description = (meeting.get('description') or '').lower()
                         
                         if meaningful_tokens:
                             match_count = sum(1 for token in meaningful_tokens if token in title or token in description)
                             score = match_count / len(meaningful_tokens) if meaningful_tokens else 0
                             best_match_score = max(best_match_score, score)
                     
-                    # 매칭 점수가 높으면 (80% 이상) → 선택으로 처리
+                    # 매칭 점수가 높으면 (80% 이상) → 선택 시도
                     if best_match_score >= 0.8:
-                        print(f"[DEBUG] 검색 의도 있지만 강한 매칭 ({best_match_score:.2f}) → 선택: '{user_query}'")
-                        return handle_selection(user_query, context, request, session_id)
+                        print(f"[DEBUG] 검색 의도 있지만 강한 매칭 ({best_match_score:.2f}) → 선택 시도: '{user_query}'")
+                        selection_result = handle_selection(user_query, context, request, session_id)
+                        
+                        # None이면 선택 실패 → 새로운 검색
+                        if selection_result is None:
+                            print(f"[DEBUG] 선택 실패 → 새로운 검색 시작")
+                            delete_context(session_id)
+                            # 아래 검색 로직으로 계속 진행
+                        else:
+                            return selection_result
                     else:
                         # 매칭 점수 낮음 → 새로운 검색
                         print(f"[DEBUG] 검색 의도 감지 + 약한 매칭 ({best_match_score:.2f}) → 새로운 검색: '{user_query}'")
@@ -2626,45 +3309,106 @@ async def chat(request: ChatRequest):
                     
                     # 단일 날짜 패턴 (범위 아님)
                     elif re.search(r'^\d{1,2}월\s*\d{1,2}일$|^\d{1,2}일$', user_query.strip()):
-                        print(f"[DEBUG] 단일 날짜 감지 → 선택 처리: '{user_query}'")
-                        return handle_selection(user_query, context, request, session_id)
-
+                        print(f"[DEBUG] 단일 날짜 감지 → 선택 시도: '{user_query}'")
+                        selection_result = handle_selection(user_query, context, request, session_id)
+                        
+                        if selection_result is None:
+                            print(f"[DEBUG] 선택 실패 → 새로운 검색 시작")
+                            delete_context(session_id)
+                            # 아래 검색 로직으로 계속 진행
+                        else:
+                            return selection_result
+                        
                     # 키워드로 컨텍스트 매칭
                     meetings = context.get('meetings', [])
                     user_query_lower = user_query.lower()
                     
                     for meeting in meetings:
                         title = meeting.get('title', '').lower()
-                        description = meeting.get('description', '').lower()
+                        description = (meeting.get('description') or '').lower()
                         
                         # 입력이 제목/설명에 포함되면 선택
                         if user_query_lower in title or user_query_lower in description:
-                            print(f"[DEBUG] 컨텍스트 직접 매칭 → 선택: '{user_query}'")
-                            return handle_selection(user_query, context, request, session_id)
-                    
-                    # 매칭 실패 → 선택 시도 (handle_selection이 알아서 처리)
+                            print(f"[DEBUG] 컨텍스트 직접 매칭 → 선택 시도: '{user_query}'")
+                            selection_result = handle_selection(user_query, context, request, session_id)
+                            
+                            if selection_result is None:
+                                print(f"[DEBUG] 선택 실패 → 새로운 검색 시작")
+                                delete_context(session_id)
+                                # 아래 검색 로직으로 계속 진행
+                            else:
+                                return selection_result
+    
+                    # 매칭 실패 → 선택 시도
                     print(f"[DEBUG] 컨텍스트 있음 + 검색 의도 없음 → 선택 시도: '{user_query}'")
-                    return handle_selection(user_query, context, request, session_id)
+                    selection_result = handle_selection(user_query, context, request, session_id)
+
+                    if selection_result is None:
+                        print(f"[DEBUG] 선택 실패 → 새로운 검색 시작")
+                        delete_context(session_id)
+                        # 아래 검색 로직으로 계속 진행
+                    else:
+                        return selection_result
 
         # === 0단계: 오프토픽 필터링 ===
-        if is_off_topic_query(user_query):
-            # 예외: 키워드가 있고 "회의" 단어가 포함되어 있으면 회의 검색 시도
-            if ('회의' in user_query or '미팅' in user_query) and (keywords and len(keywords) > 0):
-                print(f"[DEBUG] 오프토픽이지만 회의 키워드 있음 → 회의 검색 계속 진행")
-                # 오프토픽 체크 통과, 아래로 계속 진행
-            else:
-                print(f"\n🚫 오프토픽 → 회의록 검색 전용 안내")
-                answer = get_off_topic_response()
-                
+        # ========== 페이지네이션 키워드 정규식 패턴 ==========
+        pagination_keywords = ['나머지', '나머지도', '남은', '남은거', '더', '더보기', '더보여', 
+                            '더있어', '더줘', '더알려', '추가', '추가로', '계속', '이어서', 
+                            '다음', '다른', '또', '그외', '외', '그밖', '더있나', '더있니', 
+                            '또뭐', '또있어', '나머', '남머', '나미', '더보',
+                            '줘봐', '줘', '보여줘']
+
+        pagination_patterns = [
+            r'나머.*',
+            r'남은.*',
+            r'더.*[보줘있알려]',
+            r'추가.*',
+            r'계속|이어서|다음',
+            r'또.*[있뭐어]',
+            r'그\s*외',
+            r'더\s*[보줘]',
+            r'줘\s*봐',
+            r'보여\s*줘'
+        ]
+
+        has_pagination = (any(kw in user_query for kw in pagination_keywords) or 
+                        any(re.search(pattern, user_query) for pattern in pagination_patterns))
+
+        if context and context.get('meetings') and has_pagination:
+            print(f"[DEBUG] 페이지네이션 키워드 감지 → 오프토픽 체크 스킵")
+            # 오프토픽 체크 건너뛰고 아래로 진행
+        else:
+            # 인사말이나 의미 없는 입력 체크
+            simple_greetings = ['ㅎㅇ', 'ㅎㅇㅎㅇ', 'ㅎ2', 'ㄱㄷ', 'ㅂ2', 'ㅂㅂ', 'ㄴㄴ']
+            if user_query.strip() in simple_greetings:
+                answer = "안녕하세요! 😊 회의록 검색을 도와드릴게요.\n궁금한 회의를 물어보세요!"
                 return ChatResponse(
                     answer=answer,
                     history=request.history + [
                         {"role": "user", "content": user_query},
                         {"role": "assistant", "content": answer}
                     ],
-                    source="off_topic",
+                    source="greeting",
                     session_id=session_id
                 )
+
+            if is_off_topic_query(user_query):
+                # 예외: 키워드가 있고 "회의" 단어가 포함되어 있으면 회의 검색 시도
+                if ('회의' in user_query or '미팅' in user_query) and (keywords and len(keywords) > 0):
+                    print(f"[DEBUG] 오프토픽이지만 회의 키워드 있음 → 회의 검색 계속 진행")
+                else:
+                    print(f"\n🚫 오프토픽 → 회의록 검색 전용 안내")
+                    answer = get_off_topic_response()
+                    
+                    return ChatResponse(
+                        answer=answer,
+                        history=request.history + [
+                            {"role": "user", "content": user_query},
+                            {"role": "assistant", "content": answer}
+                        ],
+                        source="off_topic",
+                        session_id=session_id
+                    )
 
         # === Intent 처리가 안 된 경우에만 MySQL 검색 진행 ===
         # (위에서 task_search, participant_search는 이미 처리됨)
@@ -2673,17 +3417,56 @@ async def chat(request: ChatRequest):
         date_info = parse_date_from_query(user_query)
         status = parse_status_from_query(user_query)
         
-        # ========== "최근" 키워드가 있으면 완료된 회의만 검색 ==========
-        if date_info and date_info.get('recent_flag'):
-            if not status:  # 상태가 명시되지 않았으면
-                status = 'COMPLETED'
-                print(f"[DEBUG] '최근' 키워드 감지 → 완료된 회의만 검색")
-
         from .search import search_meetings_direct
 
         search_response, meetings = search_meetings_direct(
             user_query, date_info, status, user_job_normalized, selected_meeting_id, user_id
         )
+
+        # ========== 완화 성공 체크 (최우선!) ==========
+        if search_response and search_response.startswith("[FALLBACK_SUCCESS]"):
+            # 마커 제거
+            final_message = search_response.replace("[FALLBACK_SUCCESS]", "")
+            print(f"[DEBUG] 단계적 완화 성공 감지 → 컨텍스트 저장 후 반환")
+            
+            # ========== 컨텍스트 저장 (선택 가능하도록!) ==========
+            if meetings and len(meetings) > 0:
+                # datetime → str 변환
+                meetings_serializable = []
+                for meeting in meetings:
+                    meeting_copy = {}
+                    for key, value in meeting.items():
+                        if isinstance(value, datetime):
+                            meeting_copy[key] = value.isoformat()
+                        else:
+                            meeting_copy[key] = value
+                    meetings_serializable.append(meeting_copy)
+                
+                shown_completed, shown_scheduled = calculate_shown_counts(meetings[:5])
+
+                # 컨텍스트 저장
+                context_data = {
+                    'state': 'awaiting_selection',
+                    'shown_completed': shown_completed,
+                    'shown_scheduled': shown_scheduled,
+                    'meetings': meetings_serializable,
+                    'total_count': len(meetings),
+                    'shown_completed': 3,
+                    'shown_scheduled': 3,
+                    'original_query': user_query
+                }
+                save_context(session_id, context_data)
+                print(f"[DEBUG] 완화 성공 → 컨텍스트 저장: {len(meetings)}개")
+            
+            return ChatResponse(
+                answer=final_message,
+                history=request.history + [
+                    {"role": "user", "content": user_query},
+                    {"role": "assistant", "content": final_message}
+                ],
+                source="fallback_success",
+                session_id=session_id
+            )
         
         # MySQL 완전 실패
         if not search_response:
@@ -2727,8 +3510,16 @@ async def chat(request: ChatRequest):
         if total > 1:
             print(f"[DEBUG] {total}개 회의 발견 → 컨텍스트 저장")
             
+            # ========== 상태별 분리 후 재정렬 ==========
+            completed_meetings = [m for m in meetings if m.get('status') == 'COMPLETED']
+            scheduled_meetings = [m for m in meetings if m.get('status') == 'SCHEDULED']
+            
+            # 완료 + 예정 순서로 병합
+            reordered_meetings = completed_meetings + scheduled_meetings
+            
+            # datetime → str 변환
             meetings_serializable = []
-            for meeting in meetings:
+            for meeting in reordered_meetings:  # 재정렬된 순서로 저장
                 meeting_copy = {}
                 for key, value in meeting.items():
                     if isinstance(value, datetime):
@@ -2737,23 +3528,32 @@ async def chat(request: ChatRequest):
                         meeting_copy[key] = value
                 meetings_serializable.append(meeting_copy)
             
-            # 컨텍스트 저장
+            # ========== 상태별 분리 포맷팅 적용 (컨텍스트 저장 전에) ==========
+            final_answer, shown_completed, shown_scheduled = format_multiple_meetings_short(
+                meetings,
+                user_query,
+                total,
+                date_info,
+                status
+            )
+
+            # 컨텍스트 저장 (실제 표시된 개수로!)
             context = {
-                'state': 'meeting_list_shown',  # ← 수정!
-                'meeting_list': meetings_serializable,  # ← 수정!
-                'meetings': meetings_serializable,  # 하위 호환성 유지
-                'last_shown_index': 5,  # ← 추가!
-                'shown_count': 5,
+                'state': 'awaiting_selection',
+                'shown_completed': shown_completed,
+                'shown_scheduled': shown_scheduled,
+                'meeting_list': meetings_serializable,
+                'meetings': meetings_serializable,
+                'last_shown_index': min(5, total),
+                'offset': min(5, total),
+                'shown_count': min(5, total),
                 'total_count': total,
                 'original_query': user_query
             }
+
             save_context(session_id, context)
-            print(f"[DEBUG] 컨텍스트 저장 완료: {len(meetings_serializable)}개 회의")
-            
-            # 여러 회의는 format_multiple_meetings_short 결과를 그대로 사용
-            # (HyperCLOVA X 호출하면 hallucination 위험이 있음)
-            final_answer = search_response
-            
+            print(f"[DEBUG] 컨텍스트 저장 완료: {len(meetings_serializable)}개 회의 (shown_completed={shown_completed}, shown_scheduled={shown_scheduled})")
+
             return ChatResponse(
                 answer=final_answer,
                 history=request.history + [
@@ -2872,27 +3672,28 @@ def is_obvious_pattern(user_query: str) -> bool:
         bool(re.match(r'^\d{1,2}월\s?\d{1,2}일$', user_query.strip())),
         (len(user_query) > 8 and 
          ('회의' in user_query or '미팅' in user_query) and 
-         not any(w in user_query for w in ['?', '뭐', '어떤', '있어', '저', '그', '이']) and  # ← 대명사 추가
+         not any(w in user_query for w in ['?', '뭐', '어떤', '있어', '저', '그', '이']) and
          not ('에서' in user_query and len(user_query) < 15)),  # ← "회의에서" 같은 짧은 질문 제외
     ]
     return any(obvious_patterns)
 
 def needs_llm_analysis(user_query: str, context: dict) -> bool:
     """
-    LLM 분석이 필요한지 확인
+    LLM 분석이 필요한지 확인 (최소화)
     """
-    # 짧고 애매한 질문
-    if len(user_query) < 15:
+    # ========== 0. awaiting_selection 상태면 LLM 안 씀 ==========
+    if context and context.get('state') == 'awaiting_selection':
+        return False
+    
+    # 1. 명확한 오타가 있으면 LLM 필요
+    if any(char in user_query for char in ['ㅅ', 'ㅈ', 'ㄱ', 'ㄴ', 'ㅏ', 'ㅓ', 'ㅗ', 'ㅜ']):
         return True
     
-    # 컨텍스트 있는 상태에서 대명사 사용
-    if context and context.get('state') == 'meeting_selected':
-        pronouns = ['그', '저', '이', '거기', '여기', '사람', '누가']
+    # 2. 컨텍스트 있고 대명사만 쓴 짧은 질문 (5자 이하)
+    if context and context.get('state') == 'meeting_selected' and len(user_query) <= 5:
+        pronouns = ['그거', '저거', '이거', '거기', '여기']
         if any(p in user_query for p in pronouns):
             return True
     
-    # 물음표 있는 질문
-    if '?' in user_query:
-        return True
-    
+    # 3. 그 외는 LLM 안 씀
     return False

@@ -78,12 +78,33 @@ def save_context(session_id: str, context: dict, ttl: int = 600):
         return False
     
     try:
-        context_json = json.dumps(context, ensure_ascii=False)
+        # datetime과 bytes를 JSON 직렬화 가능하게 변환
+        def convert_to_json_serializable(obj):
+            """JSON 직렬화 가능한 형태로 변환"""
+            from datetime import datetime
+            
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            elif isinstance(obj, bytes):
+                return obj.decode('utf-8', errors='ignore')
+            elif isinstance(obj, dict):
+                return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_json_serializable(item) for item in obj]
+            else:
+                return obj
+        
+        # 컨텍스트 전체를 변환
+        serializable_context = convert_to_json_serializable(context)
+        
+        context_json = json.dumps(serializable_context, ensure_ascii=False)
         client.setex(f"context:{session_id}", ttl, context_json)
         logger.info(f"컨텍스트 저장 성공: {session_id}")
         return True
     except Exception as e:
         logger.error(f"컨텍스트 저장 실패: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def delete_context(session_id: str):

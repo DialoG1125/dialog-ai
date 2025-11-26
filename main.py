@@ -45,11 +45,9 @@ from summary.action_service import (
 # --- 내부 모듈: 챗봇 관련 ---
 # chatbotSearchMain에서 chat_endpoint 함수 import
 from chatbot.chatbotSearch.chatbotSearchMain import chat as chatbot_chat_endpoint
-from chatbot.chatbotSearch.models import ChatRequest, ChatResponse
 
-# chatbotFAQMain에서 FAQ chat_endpoint 함수 import  
-from chatbot.chatbotFAQ.chatbotFAQMain import chat as chatbot_faq_endpoint
-
+from chatbot.chatbotSearch.models import ChatRequest as SearchChatRequest, ChatResponse
+from chatbot.chatbotFAQ.chatbotFAQMain import ChatRequest as FAQChatRequest, chat as chatbot_faq_endpoint
 
 # ======================================================
 # FastAPI 기본 설정
@@ -97,7 +95,7 @@ async def health_check():
 # 2. 챗봇 엔드포인트
 # ======================================================
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: SearchChatRequest):
     """회의록 검색 챗봇"""
     try:
         result = await chatbot_chat_endpoint(request)
@@ -113,7 +111,7 @@ async def chat_endpoint(request: ChatRequest):
 
 
 @app.post("/api/faq", response_model=ChatResponse)
-async def faq_endpoint(request: ChatRequest):
+async def faq_endpoint(request: FAQChatRequest):
     """FAQ 챗봇 (IT 용어)"""
     try:
         return await chatbot_faq_endpoint(request)
