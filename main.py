@@ -22,6 +22,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+# --- STT 발화자 분석 관련 ---
+from pydantic import BaseModel
+from typing import Optional
+
 # --- 내부 모듈: STT 관련 ---
 from stt.sttStreaming import ClovaSpeechRecognizer
 from stt.sttSpeaker import ClovaSpeakerAnalyzer, convert_language_code
@@ -156,64 +160,121 @@ async def websocket_realtime_stt(websocket: WebSocket):
     실시간 STT WebSocket 엔드포인트
     - gRPC 기반 CLOVA Speech Streaming
     - 실시간 텍스트 변환 및 Object Storage 업로드
+    - 발화자 구분 없음
     """
+    ws_pcm_buffer = bytearray()    
     await websocket.accept()
     recognizer = ClovaSpeechRecognizer()
+    is_connected = True
+    
+    # stop 호출 여부 플래그
+    is_stopped = False
 
     try:
-        while True:
+        while is_connected:
+            # -------------------------
+            # 1) WebSocket 메시지 수신
+            # -------------------------
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
-                data = json.loads(msg)
+                msg = await websocket.receive()
+            except RuntimeError as e:
+                if "disconnect" in str(e).lower():
+                    print("🔌 WebSocket 연결이 이미 종료됨")
+                    is_connected = False
+                    break
+                raise
+            
+            # 연결 종료 메시지 확인
+            if msg["type"] == "websocket.disconnect":
+                print("📡 WebSocket disconnect 메시지 수신")
+                is_connected = False
+                break
 
-                # 🎙️ 녹음 시작
-                if data["action"] == "start":
-                    language = data.get("language", "ko")
-                    recognizer.connect()
-                    recognizer.start_recording()
-                    recognizer.start_recognition(language)
+            # 텍스트 메시지 처리
+            if msg["type"] == "websocket.receive" and msg.get("text"):
+                try:
+                    data = json.loads(msg["text"])
 
-                    await websocket.send_json({
-                        "type": "status",
-                        "message": "recording",
-                        "info": "STT 시작 (녹음 및 업로드 준비 중)"
-                    })
+                    # STT 시작
+                    if data["action"] == "start":
+                        language = data.get("language", "ko")
 
-                # ⏸️ 녹음 일시정지
-                elif data["action"] == "pause":
-                    if recognizer.pause_recording():
+                        recognizer.connect()
+                        recognizer.start_recording()
+                        recognizer.start_recognition(language)
+
                         await websocket.send_json({
                             "type": "status",
-                            "message": "paused",
-                            "info": "STT 일시정지됨"
+                            "message": "recording",
+                            "info": "STT 시작 (녹음 및 업로드 준비 중)"
                         })
 
-                # ▶️ 녹음 재개
-                elif data["action"] == "resume":
-                    if recognizer.resume_recording():
+                    # 일시정지
+                    elif data["action"] == "pause":
+                        if recognizer.pause_recording():
+                            await websocket.send_json({
+                                "type": "status",
+                                "message": "paused",
+                                "info": "STT 일시정지됨"
+                            })
+
+                    # 재개
+                    elif data["action"] == "resume":
+                        if recognizer.resume_recording():
+                            await websocket.send_json({
+                                "type": "status",
+                                "message": "resumed",
+                                "info": "STT 재개됨"
+                            })
+
+                    # # 중지
+                    # elif data["action"] == "stop":
+                    #     recognizer.stop_recording()
+                    #     await websocket.send_json({
+                    #         "type": "status",
+                    #         "message": "stopping",
+                    #         "info": "녹음 중지 중..."
+                    #     })
+
+                    elif data["action"] == "stop":
+                        if not is_stopped:
+                            is_stopped = True
+                            recognizer.stop_recording()
+                        
                         await websocket.send_json({
                             "type": "status",
-                            "message": "resumed",
-                            "info": "STT 재개됨"
+                            "message": "stopping",
+                            "info": "녹음 중지 중..."
                         })
 
-                # 🛑 녹음 중지
-                elif data["action"] == "stop":
-                    recognizer.stop_recording()
+                except Exception as e:
                     await websocket.send_json({
-                        "type": "status",
-                        "message": "stopping",
-                        "info": "녹음 중지 중..."
+                        "type": "error",
+                        "message": f"text parse error: {str(e)}"
                     })
 
-            except asyncio.TimeoutError:
-                pass
+            # 바이너리(PCM) 데이터 처리
+            # WebSocket 통신 중에 byte 깨짐 확인
+            if msg["type"] == "websocket.receive" and msg.get("bytes"):
+                chunk = msg.get("bytes")
+                if chunk:
+                    ws_pcm_buffer.extend(chunk)
 
-            # 결과 처리
+                    FRAME = 320  # 16kHz 16bit 10ms PCM
+
+                    while len(ws_pcm_buffer) >= FRAME:
+                        frame = ws_pcm_buffer[:FRAME]
+                        del ws_pcm_buffer[:FRAME]
+                        recognizer.add_audio_data(bytes(frame))
+
+
+            # -------------------------
+            # 2) recognizer 결과 처리
+            # -------------------------
             try:
                 msg_type, payload = recognizer.result_queue.get_nowait()
 
-                # 실시간 인식 데이터
+                # 실시간 인식 결과
                 if msg_type == "data":
                     await websocket.send_json(payload)
 
@@ -236,6 +297,14 @@ async def websocket_realtime_stt(websocket: WebSocket):
                 elif msg_type == "done":
                     file_url = recognizer.get_uploaded_file_url()
                     
+                    print("\n" + "=" * 80)
+                    print("🎤 STT 처리 완료")
+                    print("=" * 80)
+                    print(f"   📁 파일 URL: {file_url if file_url else '❌ 없음'}")
+                    print(f"   📝 전체 텍스트: {recognizer.full_text[:100]}{'...' if len(recognizer.full_text) > 100 else ''}")
+                    print(f"   📊 문장 수: {len(recognizer.sentences)}개")
+                    print("=" * 80 + "\n")
+
                     await websocket.send_json({
                         "type": "done",
                         "fullText": recognizer.full_text,
@@ -244,35 +313,9 @@ async def websocket_realtime_stt(websocket: WebSocket):
                         "file_url": file_url,
                         "info": "STT 완료. Object Storage 업로드 완료"
                     })
-                    
-                    # 자동으로 발화자 분석 시작 (file_url이 있는 경우)
-                    if file_url:
-                        print(f"\n🚀 자동 발화자 분석 시작: {file_url}")
-                        analyzer = ClovaSpeakerAnalyzer()
-                        analysis_result = analyzer.analyze_audio_url_async(
-                            file_url=file_url,
-                            language="ko-KR",
-                            speaker_min=-1,
-                            speaker_max=-1
-                        )
-                        
-                        if "token" in analysis_result:
-                            await websocket.send_json({
-                                "type": "speaker_analysis_started",
-                                "token": analysis_result.get("token"),
-                                "file_url": file_url,
-                                "info": "발화자 분석 시작됨"
-                            })
-                        else:
-                            await websocket.send_json({
-                                "type": "speaker_analysis_error",
-                                "error": analysis_result.get("error", "Unknown error"),
-                                "info": "발화자 분석 시작 실패"
-                            })
-                    
-                    break
 
-                # STT 에러
+                    break  # 루프 종료
+
                 elif msg_type == "error":
                     await websocket.send_json({
                         "type": "error",
@@ -280,128 +323,114 @@ async def websocket_realtime_stt(websocket: WebSocket):
                     })
 
             except queue.Empty:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.005)
 
     except WebSocketDisconnect:
         print("📡 WebSocket 연결 종료 (클라이언트 측)")
     except Exception as e:
         print(f"❌ WebSocket 예외 발생: {e}")
-        await websocket.send_json({"type": "error", "message": str(e)})
+        import traceback
+        print(traceback.format_exc())
+        
+        # WebSocket이 아직 연결되어 있을 때만 에러 메시지 전송
+        try:
+            if is_connected:
+                await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception as send_error:
+            print(f"⚠️ 에러 메시지 전송 실패 (이미 연결 종료됨): {send_error}")
+
+    # finally:
+    #     recognizer.stop_recording()
+    #     recognizer.disconnect()
+    #     print("🧹 WebSocket 리소스 정리 완료")
+
     finally:
-        recognizer.stop_recording()
+        if not is_stopped:
+            is_stopped = True
+            recognizer.stop_recording()
+    
         recognizer.disconnect()
         print("🧹 WebSocket 리소스 정리 완료")
 
+# ======================================================
+# 5. 발화자 분석 요청 모델
+# ======================================================
+class SpeakerAnalysisRequest(BaseModel):
+    file_url: str
+    language: str = "ko"
+    speaker_min: int = 2
+    speaker_max: int = 10
+    callback_url: Optional[str] = None
 
 # ======================================================
-# 5. 발화자 분석 엔드포인트 (Object Storage & Local)
+# 6. 발화자 분석 엔드포인트
 # ======================================================
 @app.post("/api/analyze/object")
-async def analyze_from_object_storage(
-    file_url: str,
-    language: str = "ko",
-    speaker_min: int = -1,
-    speaker_max: int = -1,
-    callback_url: str = None
-):
-    """Object Storage URL 기반 비동기 발화자 분석"""
-    try:
-        print(f"\n🎧 CLOVA ExternalURL 분석 요청: {file_url}")
-        
-        analyzer = ClovaSpeakerAnalyzer()
-        lang = convert_language_code(language)
+async def analyze_from_object_storage(request: SpeakerAnalysisRequest):
+    """
+    Object Storage URL → CLOVA ExternalURL 호출 (resultToObs=True)
+    JSON은 버킷에 자동 저장됨.
+    """
+    print("\n" + "=" * 80)
+    print("CLOVA ExternalURL 비동기 발화자 분석 요청 시작")
+    print(f"file_url = {request.file_url}")
+    print("=" * 80)
 
-        result = analyzer.analyze_audio_url_async(
-            file_url=file_url,
-            language=lang,
-            speaker_min=speaker_min,
-            speaker_max=speaker_max,
-            callback_url=callback_url
-        )
+    # WAV 파일명 파싱
+    original_filename = request.file_url.split("/")[-1]
+    print(f"추출된 파일명: {original_filename}")
 
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+    analyzer = ClovaSpeakerAnalyzer()
+    lang = convert_language_code(request.language)
 
-        return {
-            "status": "started",
-            "token": result.get("token"),
-            "file_url": file_url,
-            "message": "CLOVA 비동기 분석 요청 성공"
-        }
+    result = analyzer.analyze_audio_url_async(
+        file_url=request.file_url,
+        language=lang,
+        speaker_min=request.speaker_min,
+        speaker_max=request.speaker_max,
+        callback_url=request.callback_url
+    )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
 
+    token = result.get("token")
 
+    print(f"CLOVA 요청 완료! token={token}")
+    print("=" * 80)
+
+    return {
+        "status": "started",
+        "token": token,
+        "original_filename": original_filename,
+        "message": "CLOVA 비동기 분석 요청 성공"
+    }
+
+# ======================================================
+# 7. 발화자 분석 엔드포인트
+# ======================================================
 @app.get("/api/analyze/{token}")
-async def get_async_result(token: str):
-    """비동기 발화자 분석 결과 조회"""
-    analyzer = ClovaSpeakerAnalyzer()
-    result = analyzer.get_async_result(token)
-    
-    if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
-    
-    # 완료 시 로그 출력
-    if result.get("status") == "COMPLETED":
-        print(f"\n🎉 분석 완료! (Token: {token})")
-        print(f"👥 화자 수: {result.get('totalSpeakers', 0)}명")
-
-    return result
-
-
-@app.post("/api/analyze")
-async def analyze_speaker_sync(
-    language: str = "ko",
-    speaker_min: int = -1,
-    speaker_max: int = -1
-):
-    """로컬 파일 동기 분석"""
-    path = "recordings/session_audio.wav"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="로컬 오디오 파일 없음")
+async def get_async_result(token: str, filename: str):
+    """
+    resultToObs=True → JSON 파일을 직접 Object Storage에서 fetch하여 반환
+    """
+    print("\n" + "=" * 80)
+    print(f"비동기 결과 조회: token={token}, filename={filename}")
+    print("=" * 80)
 
     analyzer = ClovaSpeakerAnalyzer()
-    result = analyzer.analyze_audio_file(
-        audio_file_path=path,
-        language=convert_language_code(language),
-        speaker_min=speaker_min,
-        speaker_max=speaker_max
-    )
 
-    if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
-    return result
+    json_data = analyzer.fetch_obs_json(filename, token)
 
+    if "error" in json_data:
+        raise HTTPException(status_code=500, detail=json_data["error"])
 
-@app.post("/api/analyze/async")
-async def analyze_speaker_async(
-    language: str = "ko",
-    speaker_min: int = -1,
-    speaker_max: int = -1,
-    callback_url: str = None
-):
-    """로컬 파일 비동기 분석"""
-    path = "recordings/session_audio.wav"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="로컬 오디오 파일 없음")
-
-    analyzer = ClovaSpeakerAnalyzer()
-    result = analyzer.analyze_audio_file_async(
-        audio_file_path=path,
-        language=convert_language_code(language),
-        speaker_min=speaker_min,
-        speaker_max=speaker_max,
-        callback_url=callback_url
-    )
-
-    if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
+    result = analyzer.process_obs_json(json_data)
     return result
 
 
 # ======================================================
-# 6. 유틸리티 (다운로드)
+# 8. 유틸리티 (다운로드)
 # ======================================================
 @app.get("/api/download/audio")
 async def download_audio():
