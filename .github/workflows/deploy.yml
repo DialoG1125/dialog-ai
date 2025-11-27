@@ -1,0 +1,74 @@
+name: CI/CD AI Server to EC2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # CI: 빌드 검증
+  ci:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      
+      - name: Verify Required Files
+        run: |
+          test -f requirements.txt || { echo "requirements.txt not found"; exit 1; }
+          test -f Dockerfile || { echo "Dockerfile not found"; exit 1; }
+          test -f main.py || { echo "main.py not found"; exit 1; }
+      
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Docker Build Test
+        run: |
+          docker build -t dialog-ai-test .
+
+  # CD: 배포 (main 브랜치만)
+  cd:
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t munwalk/dialog-ai:latest .
+          docker push munwalk/dialog-ai:latest
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /opt/dialog
+            # 기존 AI 컨테이너 정리
+            docker-compose stop ai-server || true
+            docker-compose rm -f ai-server || true
+            # 최신 이미지 받기
+            docker pull munwalk/dialog-ai:latest
+            # AI 서버 재시작
+            docker-compose up -d --no-deps ai-server
+            # 상태 확인
+            docker ps | grep dialog-ai
