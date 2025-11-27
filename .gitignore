@@ -343,9 +343,7 @@ pip-delete-this-directory.txt
 .env
 .env.*
 
-# gRPC auto-generated files
-*_pb2.py
-*_pb2_grpc.py
-
-# nest
-stt/nest
+# gRPC auto-generated files (자동 생성 파일만 제외)
+stt/nest/*_pb2.py
+stt/nest/*_pb2_grpc.py
+stt/nest/__pycache__/
