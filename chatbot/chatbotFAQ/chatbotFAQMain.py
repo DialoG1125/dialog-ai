@@ -12,7 +12,7 @@ import json
 from typing import Dict, Any, Optional, List
 
 # ================== 설정 ==================
-TERMS_DB_FILE = os.getenv('TERMS_DB_FILE', './data/terms_database.json')
+TERMS_DB_FILE = os.getenv('TERMS_DB_FILE', '/app/chatbot/chatbotFAQ/data/terms_database.json')
 
 # HyperCLOVA X API
 CLOVA_STUDIO_URL = os.getenv('CLOVA_STUDIO_URL')
