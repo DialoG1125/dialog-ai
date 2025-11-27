@@ -114,11 +114,16 @@ async def chat_endpoint(request: SearchChatRequest):
 async def faq_endpoint(request: FAQChatRequest):
     """FAQ 챗봇 (IT 용어)"""
     try:
+        # FAQ 모듈 데이터 로드 확인
+        from chatbot.chatbotFAQ.chatbotFAQMain import load_terms_database
+        load_terms_database()
+        
         return await chatbot_faq_endpoint(request)
     except Exception as e:
         print(f"❌ FAQ 오류: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ======================================================
 # 3. AI 요약 및 할 일 생성 엔드포인트

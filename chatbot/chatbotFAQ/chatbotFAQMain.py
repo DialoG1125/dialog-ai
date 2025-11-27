@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 import os
+from pathlib import Path
 
 # 환경변수 로드
 load_dotenv()
@@ -37,16 +38,48 @@ app.add_middleware(
 )
 
 # ================== 데이터 로드 ==================
+# terms_db = {}
+
+# try:
+#     with open(TERMS_DB_FILE, 'r', encoding='utf-8') as f:
+#         terms_db = json.load(f)
+#     print(f"✅ {len(terms_db)}개 용어 로드 완료")
+# except FileNotFoundError:
+#     print(f"❌ {TERMS_DB_FILE} 파일이 없습니다!")
+# except Exception as e:
+#     print(f"❌ 데이터 로드 실패: {e}")
+
+# ================== 데이터 로드 ==================
 terms_db = {}
 
-try:
-    with open(TERMS_DB_FILE, 'r', encoding='utf-8') as f:
-        terms_db = json.load(f)
-    print(f"✅ {len(terms_db)}개 용어 로드 완료")
-except FileNotFoundError:
-    print(f"❌ {TERMS_DB_FILE} 파일이 없습니다!")
-except Exception as e:
-    print(f"❌ 데이터 로드 실패: {e}")
+def load_terms_database():
+    """용어 데이터베이스 로드 (명시적 호출용)"""
+    global terms_db
+    
+    if terms_db:  # 이미 로드됨
+        return
+    
+    # 절대 경로로 변환
+    if TERMS_DB_FILE.startswith('./'):
+        base_path = Path(__file__).parent
+        file_path = base_path / TERMS_DB_FILE.replace('./', '')
+    else:
+        file_path = Path(TERMS_DB_FILE)
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            terms_db = json.load(f)
+        print(f"✅ {len(terms_db)}개 용어 로드 완료 (경로: {file_path})")
+    except FileNotFoundError:
+        print(f"❌ {file_path} 파일이 없습니다!")
+        print(f"   현재 작업 디렉토리: {os.getcwd()}")
+    except Exception as e:
+        print(f"❌ 데이터 로드 실패: {e}")
+        import traceback
+        traceback.print_exc()
+
+# 초기 로드 시도
+load_terms_database()
 
 # ================== 유연한 검색 함수 ==================
 def search_term_flexible(query: str) -> Optional[Dict[str, Any]]:
@@ -285,10 +318,22 @@ async def clova_proxy(request: dict):
 async def chat(request: ChatRequest):
     """
     비용 효율적인 폴백 채팅 엔드포인트
-    1. JSON 검색 (무료, 빠름)
-    2. 챗봇 빌더 (저렴, 정확)
-    3. HyperCLOVA X (비쌈, 유연함)
     """
+    # 데이터 로드 확인
+    if not terms_db:
+        print("⚠️ terms_db 비어있음 - 재로드 시도")
+        load_terms_database()
+        
+        if not terms_db:
+            return ChatResponse(
+                answer="죄송해요, 용어 데이터베이스를 로드할 수 없어요. 😢",
+                history=request.history + [
+                    {"role": "user", "content": request.message},
+                    {"role": "assistant", "content": "데이터베이스 로드 실패"}
+                ],
+                source="error"
+            )
+    
     try:        
         # === 1단계: JSON 검색 (무료, 가장 빠름!) ===
         print(f"\n📚 [1단계] JSON 검색: '{request.message}'")
