@@ -2336,7 +2336,7 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
         search_participants("meeting_participants", meeting_id=1)
         search_participants("person_meetings", person_name="김철수")
     """
-    from database import get_db_connection
+    from .database import get_db_connection
     import logging
     
     logger = logging.getLogger(__name__)

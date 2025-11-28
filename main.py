@@ -47,7 +47,7 @@ from summary.action_service import (
 from chatbot.chatbotSearch.chatbotSearchMain import chat as chatbot_chat_endpoint
 
 from chatbot.chatbotSearch.models import ChatRequest as SearchChatRequest, ChatResponse
-from chatbot.chatbotFAQ.chatbotFAQMain import ChatRequest as FAQChatRequest, chat as chatbot_faq_endpoint
+from chatbot.chatbotFAQ.chatbotFAQMain import ChatRequest as FAQChatRequest, ChatResponse as FAQChatResponse, chat as chatbot_faq_endpoint
 
 # ======================================================
 # FastAPI 기본 설정
@@ -110,7 +110,7 @@ async def chat_endpoint(request: SearchChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/faq", response_model=ChatResponse)
+@app.post("/api/faq", response_model=FAQChatResponse)
 async def faq_endpoint(request: FAQChatRequest):
     """FAQ 챗봇 (IT 용어)"""
     try:
