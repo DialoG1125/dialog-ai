@@ -64,117 +64,17 @@ class ActionResponse(BaseModel):
 def generate_request_id():
     return f"meeting-{int(time.time() * 1000)}-{uuid.uuid4().hex[:9]}"
 
-def convert_relative_date(relative_date: str, meeting_date_str: str) -> str:
-    if not relative_date or not meeting_date_str:
-        return relative_date
-
-    try:
-        if 'T' in meeting_date_str:
-            meeting = datetime.fromisoformat(meeting_date_str.replace('Z', '+00:00')).date()
-        else:
-            meeting = datetime.strptime(meeting_date_str, "%Y-%m-%d").date()
-    except ValueError:
-        try:
-            meeting = datetime.strptime(meeting_date_str, "%Y-%m-%d").date()
-        except ValueError:
-            return relative_date
-
-    month_end_match = re.search(r'(\d{1,2})월\s*말', relative_date)
-    if month_end_match:
-        try:
-            target_month = int(month_end_match.group(1))
-            target_year = meeting.year
-            
-            if target_month < meeting.month:
-                target_year += 1
-                
-            result_date = datetime(target_year, target_month, 1) + relativedelta(day=31)
-            return result_date.strftime("%Y-%m-%d")
-        except:
-            pass
-
-    # 연도 보정
-    if re.match(r'\d{4}-\d{2}-\d{2}', relative_date):
-        try:
-            parsed_date = datetime.strptime(relative_date, "%Y-%m-%d").date()
-            if parsed_date.year < meeting.year: 
-                new_date = parsed_date.replace(year=meeting.year)
-                return new_date.strftime("%Y-%m-%d")
-            return relative_date
-        except:
-            pass
-
-    # 말일/월말/지지난달 말 등 처리
-    if "말일" in relative_date or "월말" in relative_date or ("달" in relative_date and "말" in relative_date):
-        if "다음" in relative_date:
-            return (meeting + relativedelta(months=1, day=31)).strftime("%Y-%m-%d")
-        elif "지지난" in relative_date: 
-            return (meeting - relativedelta(months=2, day=31)).strftime("%Y-%m-%d")
-        elif "지난" in relative_date:
-            return (meeting - relativedelta(months=1, day=31)).strftime("%Y-%m-%d")
-        else:
-            return (meeting + relativedelta(day=31)).strftime("%Y-%m-%d")
-
-    # 요일 처리
-    day_map = {'월': 0, '화': 1, '수': 2, '목': 3, '금': 4, '토': 5, '일': 6}
-    day_match = re.search(r"([월화수목금토일])요일", relative_date)
-    target_weekday = day_map.get(day_match.group(1)) if day_match else None
-
-    if target_weekday is None:
-        if relative_date == "오늘": return meeting.strftime("%Y-%m-%d")
-        if relative_date == "내일": return (meeting + relativedelta(days=1)).strftime("%Y-%m-%d")
-        if relative_date == "모레": return (meeting + relativedelta(days=2)).strftime("%Y-%m-%d")
-        return relative_date
-
-    current_weekday = meeting.weekday()
-    days_since_sunday = (current_weekday + 1) % 7
-    this_week_sunday = meeting - relativedelta(days=days_since_sunday)
-
-    if "이번 주" in relative_date and target_weekday is not None:
-        target_index = (target_weekday + 1) % 7
-        result = this_week_sunday + relativedelta(days=target_index)
-        return result.strftime("%Y-%m-%d")
-
-    if "다음 주" in relative_date and target_weekday is not None:
-        next_week_sunday = this_week_sunday + relativedelta(days=7)
-        target_index = (target_weekday + 1) % 7
-        result = next_week_sunday + relativedelta(days=target_index)
-        return result.strftime("%Y-%m-%d")
-
-    if target_weekday is not None and "다음" not in relative_date and "이번" not in relative_date:
-        target_index = (target_weekday + 1) % 7
-        candidate = this_week_sunday + relativedelta(days=target_index)
-        if candidate <= meeting:
-            candidate += relativedelta(days=7)
-        return candidate.strftime("%Y-%m-%d")
-
-    return relative_date
-
 def parse_actions(
     actions_text: str, 
     speaker_mapping: Dict[str, str], 
-    meeting_date: str, 
-    convert_dates: bool = False,
     source: str = 'ai' 
 ) -> List[ActionItem]:
 
     actions = []
     lines = actions_text.split('\n')
-
-    time_regex = re.compile(r'((?:오전|오후)?\s*\d{1,2}시(?:\s*\d{1,2}분)?)')
     
-    date_patterns = [
-        r'\d{4}-\d{2}-\d{2}',
-        r'다음\s*주\s*[월화수목금토일]요일',
-        r'이번\s*주\s*[월화수목금토일]요일',
-        r'[월화수목금토일]요일(까지)?',
-        r'오늘|내일|모레',
-        r'이번\s*달\s*말일',
-        r'[0-9]{1,2}월\s*[0-9]{1,2}일',
-        r'[0-9]{1,2}월\s*말(일)?',
-        r'월말',
-    ]
-    date_regex = re.compile("|".join(date_patterns))
+    # 날짜 파싱 로직을 단순화했습니다 (YYYY-MM-DD만 찾음)
+    date_regex = re.compile(r'\d{4}-\d{2}-\d{2}')
 
     for line in lines:
         trimmed = line.strip()
@@ -186,14 +86,14 @@ def parse_actions(
 
         assignee = ''
         raw_assignee = ''
-        time_str = ""
         deadline = ''
 
         # 1. 담당자 파싱
         assignee_match = re.search(r'\(([^)]+)\)', text)
         if assignee_match:
             potential_assignee = assignee_match.group(1).strip()
-            if not time_regex.fullmatch(potential_assignee):
+            # 시간 형식(12시 30분)이 담당자로 오인되는 것 방지
+            if not re.match(r'(오전|오후)?\s*\d{1,2}시', potential_assignee):
                 if potential_assignee in ('팀 담당', '담당자 미지정'):
                     raw_assignee = potential_assignee
                 else:
@@ -205,49 +105,25 @@ def parse_actions(
         elif raw_assignee: 
             assignee = raw_assignee
 
-        # 2. 날짜 파싱 (대괄호 안의 내용 우선 확인)
-        found_date_str = ""
+        # 2. 날짜 파싱 (AI가 계산해준 YYYY-MM-DD 추출)
+        # 복잡한 한글 날짜 처리 로직 제거 -> 정규식으로 YYYY-MM-DD만 쏙 뽑아냄
         bracket_matches = list(re.finditer(r'\[([^\]]+)\]', text))
         
         for match in bracket_matches:
             content = match.group(1).strip()
-            if date_regex.fullmatch(content) or "요일" in content or "말일" in content or "주" in content or "월 말" in content:
-                found_date_str = content
+            # 내용이 날짜 형식이면 deadline으로 설정
+            if date_regex.fullmatch(content):
+                deadline = content
                 text = text.replace(match.group(0), '', 1).strip()
                 break
+            # 내용이 팀명인 경우(예: [백엔드팀])는 그대로 둠
 
-        if not found_date_str:
-            date_match = date_regex.search(text)
-            if date_match:
-                found_date_str = date_match.group(0)
-                text = text.replace(found_date_str, '').strip()
-
-        if found_date_str:
-            if convert_dates:
-                deadline = convert_relative_date(found_date_str, meeting_date)
-            else:
-                deadline = found_date_str
-        
         # 날짜 파싱 후 빈 대괄호 제거
         text = re.sub(r'\[\s*\]', '', text).strip()
 
-        # 3. 시간 파싱
-        time_match = time_regex.search(text)
-        if time_match:
-            time_str = time_match.group(1).strip()
-            text = text.replace(time_match.group(0), '').strip()
-
-        # 시간 추출 후 남은 잔여 텍스트 제거
-        text = re.sub(r'[\[\(]\s*(?:이전|이후|경|쯤|안으로)\s*[\]\)]', '', text).strip()
-
-        # 4. 텍스트 클리닝
-        text = re.sub(r'까지|합니다|해야\s*합니다', '', text).strip()
+        # 3. 텍스트 후처리
         text = re.sub(r'[.,;]$', '', text).strip()
-        text = re.sub(r'(을|를|은|는|이|가|와|과|에|에서)$', '', text).strip()
         text = re.sub(r'\s+', ' ', text).strip()
-        
-        if time_str:
-            text += f" ({time_str})"
 
         if "할 일 없음" in text or "없습니다" in text:
             continue
@@ -280,17 +156,16 @@ async def call_hyperclova(
 
     # 직무별 팀 키워드 정리
     team_keywords = []
-    
     if user_job == 'BACKEND_DEVELOPER':
-        team_keywords = ['백엔드 개발팀', '백엔드팀', '개발팀', '서버팀', '백엔드'] 
+        team_keywords = ['백엔드 개발팀', '백엔드팀', '개발팀', '서버팀'] 
     elif user_job == 'FRONTEND_DEVELOPER':
-        team_keywords = ['프론트엔드 개발팀', '프론트엔드팀', '프론트팀', '프론트엔드', 'UI/UX팀', '클라이언트팀']
+        team_keywords = ['프론트엔드 개발팀', '프론트엔드팀', 'UI/UX팀']
     elif user_job == 'DATABASE_ADMINISTRATOR':
-        team_keywords = ['DBA팀', 'DBA', 'DB팀', '데이터베이스팀', '데이터팀']
+        team_keywords = ['DBA팀', 'DB팀']
     elif user_job == 'SECURITY_DEVELOPER':
-        team_keywords = ['보안팀', '정보보안팀', '보안']
+        team_keywords = ['보안팀', '정보보안팀']
     elif user_job == 'PROJECT_MANAGER':
-        team_keywords = ['PM', '기획팀', '프로젝트 관리팀']
+        team_keywords = ['PM', '기획팀']
 
     team_keyword_string = ""
     if team_keywords:
@@ -301,48 +176,41 @@ async def call_hyperclova(
     prompts = {
         '액션아이템': f"당신은 [{persona_user}]의 관점에서 회의록을 작성하는 비서입니다.\n"
                     f"당신의 이름(사용자)은 '{user_name}'입니다.\n"
-                    f"현재 회의 참가자 명단: [{participants_str}]\n"
-                    f"**회의 기준 날짜: {meeting_date}**\n\n"
+                    f"현재 회의 참가자 명단: [{participants_str}]\n\n"
                     
-                    f"## 필독: 작업 지침\n"
+                    f"### [매우 중요] 날짜 계산 기준\n"
+                    f"**이 회의가 열린 날짜는 '{meeting_date}' 입니다.** (오늘이 아닙니다)\n"
+                    f"대화에 나오는 모든 상대적 시간 표현(내일, 모레, 다음주 금요일 등)은 **반드시 위 날짜를 기준으로 계산**하세요.\n"
+                    f"계산된 날짜는 **'YYYY-MM-DD' 형식으로 변환**하여 대괄호 안에 적어야 합니다.\n"
+                    f"예시: 회의 날짜가 2025-11-02일 때 '내일' -> [2025-11-03]\n\n"
+                    
+                    f"## 작업 지침\n"
                     f"회의 대화를 분석하여 **명확하게 합의된 '내 할 일(To-Do)'만** 추출하세요.\n"
-                    f"**추측해서 생성하지 마세요.** 대화에 없는 내용은 절대 만들지 마세요.\n"
                     f"할 일이 전혀 발견되지 않으면 반드시 '할 일 없음'이라고만 출력하세요.\n\n"
                     
-                    f"1. **유형 1 (본인 의지)**: '{user_name}'(당신)이 직접 하겠다고 말한 작업.\n"
-                    f"2. **유형 2 (지시 받음)**: 타인이 '{user_name}'에게 지시하거나 요청한 작업.\n"
-                    f"3. **유형 3 (팀 업무)**: '{user_name}'이 속한 팀({team_keyword_string}) 전체에 할당된 작업.\n\n"
+                    f"1. **유형 1 (본인)**: '{user_name}'(당신)이 수행할 작업.\n"
+                    f"2. **유형 2 (지시)**: 타인이 '{user_name}'에게 요청한 작업.\n"
+                    f"3. **유형 3 (팀)**: '{user_name}'이 속한 팀({team_keyword_string}) 전체의 작업.\n\n"
                     
-                    f"## 필수 포맷 규칙 (엄격 준수)\n"
-                    f"- 모든 항목은 반드시 '-' (하이픈)으로 시작하세요.\n"
-                    f"- **팀 업무(유형 3)**인 경우: 반드시 내용 맨 앞에 `[팀명]`을 대괄호로 감싸서 붙이세요.\n"
-                    f"- 형식: `- [팀명(선택)] 작업 내용 (담당자) [마감기한]`\n\n"
+                    f"## 필수 포맷 규칙\n"
+                    f"- **팀 업무(유형 3)**인 경우: 맨 앞에 `[팀명]`을 붙이세요.\n"
+                    f"- 형식: `- [팀명(선택)] 작업 내용 (담당자) [YYYY-MM-DD]`\n"
+                    f"- 날짜가 언급되지 않았다면 대괄호 `[]` 자체를 쓰지 마세요.\n\n"
                     
-                    f"## 작성 예시 (Good Case vs Bad Case)\n"
-                    f"(Good) - [백엔드팀] 쿼리 성능 개선 (담당자 미지정) [이번 주 금요일]\n"
-                    f"(Good) - 클라우드 비용 보고서 제출 ({user_name}) [내일]\n"
-                    f"(Bad) - 회의록 정리 및 공유 ({user_name}) [내일] -> (설명: 대화에 회의록 정리하겠다는 말이 없으면 절대 쓰지 말 것)\n"
-                    f"(Good) - 할 일 없음 -> (설명: 대화가 단순 잡담이거나 구체적인 할 일이 없을 때)\n\n"
-                    
-                    f"## [중요] 세부 규칙\n"
-                    f"1. **할 일이 없는 경우**:\n"
-                    f"   - 간식 논의, 단순 인사, 잡담 등 구체적 업무가 없으면 반드시 '할 일 없음'이라고만 적으세요.\n"
-                    f"   - '회의록 작성', '정리' 같은 상투적인 내용을 임의로 추가하지 마세요.\n"
-                    f"2. **날짜 표기**:\n"
-                    f"   - 대화에 날짜가 언급된 경우에만 `[내일]` 처럼 적으세요.\n"
-                    f"   - **날짜가 없으면 대괄호 []를 아예 쓰지 마세요.** 빈 괄호 `[]`도 금지입니다.\n\n"
+                    f"## 작성 예시\n"
+                    f"(Good) - [백엔드팀] API 명세서 작성 (담당자 미지정) [2025-11-28]\n"
+                    f"(Good) - 클라우드 비용 보고서 제출 ({user_name}) [2025-12-05]\n"
+                    f"(Good) - 할 일 없음\n\n"
                     
                     f"## 회의 대화\n{conversation_text}\n\n"
                     f"'{user_name}'님의 할 일 목록:"
     }
 
-
     if task_type not in prompts:
         raise ValueError(f"지원하지 않는 task_type입니다: {task_type}")
 
     system_content = persona_user
-    token_settings = { '액션아이템': 600 }
-    current_max_tokens = token_settings.get(task_type, 600)
+    current_max_tokens = 800
 
     headers = {
         'Authorization': f'Bearer {CLOVA_API_KEY}',
@@ -376,7 +244,7 @@ async def call_hyperclova(
                       data.get("result", {}).get("text", "") 
         
         if not result_text.strip().startswith("-"):
-            return ""
+            return "할 일 없음"
 
         return result_text.strip()
 
@@ -410,11 +278,11 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
 
     conversation_text = "\n".join(conversation_lines)
 
-    print(f"[{user_name}] 액션 아이템 생성 요청 (참가자: {participants_list})")
-
     target_date = request.meetingDate
     if "T" in target_date:
         target_date = target_date.split("T")[0]
+
+    print(f"[{user_name}] 액션 아이템 생성 요청 (참가자: {participants_list}, 기준일: {target_date})")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -425,17 +293,15 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
                 user_job, 
                 user_name, 
                 participants_list, 
-                target_date
+                target_date 
             )
 
-            if not actions_text:
+            if not actions_text or "할 일 없음" in actions_text:
                 return []
 
             all_actions = parse_actions(
                 actions_text, 
                 request.speakerMapping, 
-                request.meetingDate, 
-                convert_dates=True, 
                 source='ai' 
             )
             
@@ -443,13 +309,8 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
             for action in all_actions:
                 assignee = action.assignee
                 
-                # 1. 대괄호 태그가 있는지 확인 (예: [백엔드팀])
                 has_team_tag = re.match(r'^\[.*(?:팀|부서|파트).*\]', action.title)
-                
-                # 2. 대괄호 없이 'OO팀'으로 시작하는지 확인 (예: 백엔드팀은, 개발팀이)
                 starts_with_team = re.match(r'^\s*\S+(?:팀|부서|파트)', action.title)
-
-                # 3. 본문에 '팀 전체', '백엔드팀' 등 키워드가 포함되어 있는지 확인
                 has_group_keyword = (
                     "팀 전체" in action.title 
                     or "부서 전체" in action.title 
@@ -460,27 +321,19 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
                     or "개발팀" in action.title
                 )
 
-                # 조건: 팀 태그가 있거나, 팀으로 시작하거나, 그룹 키워드가 있는 경우
                 if has_team_tag or starts_with_team or has_group_keyword:
-                    # '담당자 미지정'으로 강제 설정
                     action.assignee = "담당자 미지정"
-                    
-                    # 태그가 없었다면 강제로 [팀 업무] 태그 추가
                     if not has_team_tag:
                         action.title = f"[팀 업무] {action.title}"
-                        
                     final_actions.append(action)
 
-                # 4. 개인 업무 (참가자 명단에 있는 경우)
                 elif assignee in participants_list:
                     final_actions.append(action)
                 
-                # 5. 미지정 업무
                 elif assignee in ['담당자 미지정', '미지정', '']:
                     action.assignee = "담당자 미지정" 
                     final_actions.append(action)
 
-                # 6. 그 외
                 else:
                     action.assignee = "담당자 미지정" 
                     final_actions.append(action)
