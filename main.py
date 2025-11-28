@@ -153,9 +153,8 @@ async def generate_all_actions(request: ActionRequest):
             raise e
         raise HTTPException(status_code=500, detail=f"액션 아이템 생성 실패: {str(e)}")
 
-
 # ======================================================
-# 4. 실시간 STT WebSocket
+# 4. 실시간 STT WebSocket - 수정된 버전
 # ======================================================
 @app.websocket("/ws/realtime")
 async def websocket_realtime_stt(websocket: WebSocket):
@@ -176,10 +175,17 @@ async def websocket_realtime_stt(websocket: WebSocket):
     try:
         while is_connected:
             # -------------------------
-            # 1) WebSocket 메시지 수신
+            # 1) WebSocket 메시지 수신 (🔥 타임아웃 추가)
             # -------------------------
             try:
-                msg = await websocket.receive()
+                # 🔥 0.1초 타임아웃으로 receive 시도
+                msg = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=0.1
+                )
+            except asyncio.TimeoutError:
+                # 타임아웃 발생 시 result_queue 처리로 넘어감
+                msg = None
             except RuntimeError as e:
                 if "disconnect" in str(e).lower():
                     print("🔌 WebSocket 연결이 이미 종료됨")
@@ -187,92 +193,85 @@ async def websocket_realtime_stt(websocket: WebSocket):
                     break
                 raise
             
-            # 연결 종료 메시지 확인
-            if msg["type"] == "websocket.disconnect":
-                print("📡 WebSocket disconnect 메시지 수신")
-                is_connected = False
-                break
+            # 메시지가 있을 경우 처리
+            if msg:
+                # 연결 종료 메시지 확인
+                if msg["type"] == "websocket.disconnect":
+                    print("📡 WebSocket disconnect 메시지 수신")
+                    is_connected = False
+                    break
 
-            # 텍스트 메시지 처리
-            if msg["type"] == "websocket.receive" and msg.get("text"):
-                try:
-                    data = json.loads(msg["text"])
+                # 텍스트 메시지 처리
+                if msg["type"] == "websocket.receive" and msg.get("text"):
+                    try:
+                        data = json.loads(msg["text"])
 
-                    # STT 시작
-                    if data["action"] == "start":
-                        language = data.get("language", "ko")
+                        # STT 시작
+                        if data["action"] == "start":
+                            language = data.get("language", "ko")
 
-                        recognizer.connect()
-                        recognizer.start_recording()
-                        recognizer.start_recognition(language)
+                            recognizer.connect()
+                            recognizer.start_recording()
+                            recognizer.start_recognition(language)
 
-                        await websocket.send_json({
-                            "type": "status",
-                            "message": "recording",
-                            "info": "STT 시작 (녹음 및 업로드 준비 중)"
-                        })
-
-                    # 일시정지
-                    elif data["action"] == "pause":
-                        if recognizer.pause_recording():
                             await websocket.send_json({
                                 "type": "status",
-                                "message": "paused",
-                                "info": "STT 일시정지됨"
+                                "message": "recording",
+                                "info": "STT 시작 (녹음 및 업로드 준비 중)"
                             })
 
-                    # 재개
-                    elif data["action"] == "resume":
-                        if recognizer.resume_recording():
+                        # 일시정지
+                        elif data["action"] == "pause":
+                            if recognizer.pause_recording():
+                                await websocket.send_json({
+                                    "type": "status",
+                                    "message": "paused",
+                                    "info": "STT 일시정지됨"
+                                })
+
+                        # 재개
+                        elif data["action"] == "resume":
+                            if recognizer.resume_recording():
+                                await websocket.send_json({
+                                    "type": "status",
+                                    "message": "resumed",
+                                    "info": "STT 재개됨"
+                                })
+
+                        # 중지
+                        elif data["action"] == "stop":
+                            if not is_stopped:
+                                is_stopped = True
+                                recognizer.stop_recording()
+                            
                             await websocket.send_json({
                                 "type": "status",
-                                "message": "resumed",
-                                "info": "STT 재개됨"
+                                "message": "stopping",
+                                "info": "녹음 중지 중..."
                             })
 
-                    # # 중지
-                    # elif data["action"] == "stop":
-                    #     recognizer.stop_recording()
-                    #     await websocket.send_json({
-                    #         "type": "status",
-                    #         "message": "stopping",
-                    #         "info": "녹음 중지 중..."
-                    #     })
-
-                    elif data["action"] == "stop":
-                        if not is_stopped:
-                            is_stopped = True
-                            recognizer.stop_recording()
-                        
+                    except Exception as e:
                         await websocket.send_json({
-                            "type": "status",
-                            "message": "stopping",
-                            "info": "녹음 중지 중..."
+                            "type": "error",
+                            "message": f"text parse error: {str(e)}"
                         })
 
-                except Exception as e:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": f"text parse error: {str(e)}"
-                    })
+                # 바이너리(PCM) 데이터 처리
+                if msg["type"] == "websocket.receive" and msg.get("bytes"):
+                    chunk = msg.get("bytes")
+                    if chunk:
+                        ws_pcm_buffer.extend(chunk)
 
-            # 바이너리(PCM) 데이터 처리
-            # WebSocket 통신 중에 byte 깨짐 확인
-            if msg["type"] == "websocket.receive" and msg.get("bytes"):
-                chunk = msg.get("bytes")
-                if chunk:
-                    ws_pcm_buffer.extend(chunk)
+                        FRAME = 320  # 16kHz 16bit 10ms PCM
 
-                    FRAME = 320  # 16kHz 16bit 10ms PCM
-
-                    while len(ws_pcm_buffer) >= FRAME:
-                        frame = ws_pcm_buffer[:FRAME]
-                        del ws_pcm_buffer[:FRAME]
-                        recognizer.add_audio_data(bytes(frame))
+                        while len(ws_pcm_buffer) >= FRAME:
+                            frame = ws_pcm_buffer[:FRAME]
+                            del ws_pcm_buffer[:FRAME]
+                            recognizer.add_audio_data(bytes(frame))
 
 
             # -------------------------
-            # 2) recognizer 결과 처리
+            # 2) recognizer 결과 처리 (🔥 항상 실행)
             # -------------------------
             try:
                 msg_type, payload = recognizer.result_queue.get_nowait()
@@ -283,6 +282,7 @@ async def websocket_realtime_stt(websocket: WebSocket):
 
                 # 업로드 완료
                 elif msg_type == "audio_uploaded":
+                    print(f"🔥 audio_uploaded 메시지 전송: {payload}")
                     await websocket.send_json({
                         "type": "audio_uploaded",
                         "file_url": payload,
@@ -326,6 +326,7 @@ async def websocket_realtime_stt(websocket: WebSocket):
                     })
 
             except queue.Empty:
+                # 큐가 비어있으면 짧은 대기
                 await asyncio.sleep(0.005)
 
     except WebSocketDisconnect:
@@ -341,11 +342,6 @@ async def websocket_realtime_stt(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": str(e)})
         except Exception as send_error:
             print(f"⚠️ 에러 메시지 전송 실패 (이미 연결 종료됨): {send_error}")
-
-    # finally:
-    #     recognizer.stop_recording()
-    #     recognizer.disconnect()
-    #     print("🧹 WebSocket 리소스 정리 완료")
 
     finally:
         if not is_stopped:
@@ -442,7 +438,6 @@ async def download_audio():
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="오디오 파일을 찾을 수 없습니다.")
     return FileResponse(path=path, media_type="audio/wav", filename="session_audio.wav")
-
 
 # ======================================================
 # 서버 실행

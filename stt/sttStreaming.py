@@ -52,6 +52,9 @@ class ClovaSpeechRecognizer:
         self.current_sentence = ""
         self.recorded_frames = []
         self.uploaded_file_url = None
+        
+        # 🔥 업로드 완료 이벤트 추가
+        self.upload_complete_event = threading.Event()
 
         # PCM
         self.raw_buffer = bytearray()
@@ -233,6 +236,7 @@ class ClovaSpeechRecognizer:
         """녹음 시작 (WebSocket 수신 대기)"""
         self.is_recording = True
         self.recorded_frames = []
+        self.upload_complete_event.clear()  # 🔥 이벤트 초기화
         print("WebSocket PCM 수신 시작...")
 
     def stop_recording(self):
@@ -240,7 +244,9 @@ class ClovaSpeechRecognizer:
         self.is_recording = False
         self.is_processing = False
         print("녹음 중지 요청")
-        self._upload_audio_to_storage()
+        
+        # 🔥 별도 스레드에서 업로드 실행
+        threading.Thread(target=self._upload_audio_to_storage, daemon=True).start()
 
     def pause_recording(self):
         """녹음 일시정지"""
@@ -259,14 +265,15 @@ class ClovaSpeechRecognizer:
         return False
 
     def _upload_audio_to_storage(self):
-        """녹음된 오디오를 메모리에서 직접 Object Storage에 업로드 (오류 시 무시)"""
-        # 녹음된 데이터가 없으면 업로드하지 않음
-        if not self.recorded_frames or len(self.recorded_frames) == 0:
-            print("녹음된 오디오 데이터가 없습니다. 업로드 건너뜀")
-            self.uploaded_file_url = None
-            return
-
+        """녹음된 오디오를 메모리에서 직접 Object Storage에 업로드"""
         try:
+            # 녹음된 데이터가 없으면 업로드하지 않음
+            if not self.recorded_frames or len(self.recorded_frames) == 0:
+                print("녹음된 오디오 데이터가 없습니다. 업로드 건너뜀")
+                self.uploaded_file_url = None
+                self.result_queue.put(("audio_upload_failed", "No audio data"))
+                return
+
             # 메모리에 WAV 파일 생성
             audio_buffer = io.BytesIO()
             
@@ -279,24 +286,27 @@ class ClovaSpeechRecognizer:
             audio_buffer.seek(0)
             print(f"오디오 메모리 버퍼 생성 완료")
 
-            # Object Storage 업로드 (오류 발생해도 무시)
-            try:
-                success, result = self.upload_audio_buffer(audio_buffer)
-                if success:
-                    self.uploaded_file_url = result
-                    self.result_queue.put(("audio_uploaded", result))
-                else:
-                    print(f"Object Storage 업로드 실패 (무시됨): {result}")
-                    self.uploaded_file_url = None
-            except Exception as upload_error:
-                print(f"Object Storage 업로드 예외 (무시됨): {upload_error}")
+            # Object Storage 업로드
+            success, result = self.upload_audio_buffer(audio_buffer)
+            
+            if success:
+                self.uploaded_file_url = result
+                print(f"✅ 업로드 성공: {result}")
+                # 🔥 업로드 완료 메시지를 큐에 추가
+                self.result_queue.put(("audio_uploaded", result))
+            else:
+                print(f"❌ 업로드 실패: {result}")
                 self.uploaded_file_url = None
-
+                self.result_queue.put(("audio_upload_failed", result))
+                
         except Exception as e:
-            # 오디오 버퍼 생성 실패해도 무시
-            msg = f"오디오 버퍼 생성 실패 (무시됨): {e}"
-            print(f"{msg}")
+            msg = f"오디오 업로드 예외: {e}"
+            print(f"❌ {msg}")
             self.uploaded_file_url = None
+            self.result_queue.put(("audio_upload_failed", msg))
+        finally:
+            # 🔥 업로드 완료 이벤트 설정 (성공/실패 여부와 관계없이)
+            self.upload_complete_event.set()
 
     # ======================================================
     # gRPC 요청/응답 처리
@@ -377,29 +387,23 @@ class ClovaSpeechRecognizer:
         except grpc.RpcError as e:
             self.result_queue.put(("error", {"code": str(e.code()), "message": e.details()}))
         finally:
-            print("오디오 업로드 대기 중...")
-            time.sleep(0.5)
+            print("⏳ 오디오 업로드 대기 중...")
+            
+            # 업로드 완료를 최대 15초 대기
+            upload_success = self.upload_complete_event.wait(timeout=15)
+            
+            if upload_success:
+                print("✅ 업로드 완료 확인됨")
+            else:
+                print("⚠️ 업로드 타임아웃 (15초 초과)")
+            
+            # done 메시지는 업로드 완료 후에 전송
             self.result_queue.put(("done", None))
             print("인식 종료")
 
     # ======================================================
     # 문장 종결 판단
     # ======================================================
-    # def _is_sentence_end(self, epd_type, text, period_positions):
-    #     """문장 종결 여부 판단"""
-    #     text = text.strip()
-    #     if len(text) < 2:
-    #         return False
-    #     if epd_type in ["periodEpd", "period"]:
-    #         return True
-    #     if period_positions:
-    #         return True
-    #     if text.endswith(('.', '?', '!', '。', '!', '?')):
-    #         return True
-    #     if epd_type in ["gap", "duration", "syllable", "wordEpd"] and len(text) >= 3:
-    #         return True
-    #     return False
-
     def _is_sentence_end(self, epd_type, text, period_positions):
         """문장 종결 여부 판단 - 개선 버전"""
         text = text.strip()
