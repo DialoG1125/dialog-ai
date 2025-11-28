@@ -699,19 +699,46 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
     from .config import ENABLE_PERSONA
     from .llm import parse_query_intent
     
-    # ========== user_id → user_name 변환 ==========
+    # ========== user_id → user_name 변환 + 참가자 감지 ==========
     user_name = None
+    participant_names_in_query = []
+    
     if user_id:
         from .database import get_db_connection
-        with get_db_connection() as conn:
-            if conn:
-                cursor = conn.cursor()
+        
+        # DB 연결 생성 (사용자 이름 + 참가자 조회)
+        with get_db_connection() as conn_temp:
+            if conn_temp:
+                cursor = conn_temp.cursor()
+                
+                # 1. user_name 조회
                 cursor.execute("SELECT name FROM user WHERE id = %s", (user_id,))
                 result = cursor.fetchone()
                 if result:
                     user_name = result['name']
                     print(f"[DEBUG] user_id={user_id} → user_name={user_name}")
+                
+                # 2. 참가자 이름 감지
+                cursor.execute("SELECT DISTINCT name FROM participant")
+                all_participant_names = [row['name'] for row in cursor.fetchall()]
+                
+                for name in all_participant_names:
+                    if name in user_query and name != user_name:  # 본인 이름 제외
+                        participant_names_in_query.append(name)
+                        print(f"[DEBUG] 참가자 이름 감지: {name}")
+                
+                print(f"[DEBUG] 감지된 참가자: {participant_names_in_query}")
                 cursor.close()
+
+        # with get_db_connection() as conn:
+        #     if conn:
+        #         cursor = conn.cursor()
+        #         cursor.execute("SELECT name FROM user WHERE id = %s", (user_id,))
+        #         result = cursor.fetchone()
+        #         if result:
+        #             user_name = result['name']
+        #             print(f"[DEBUG] user_id={user_id} → user_name={user_name}")
+        #         cursor.close()
     
     with get_db_connection() as conn:
         if not conn:
@@ -746,6 +773,19 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                     """
                     params = [user_name]
 
+                    # 참가자 필터 추가 (서브쿼리 방식)
+                    if participant_names_in_query:
+                        placeholders = ', '.join(['%s'] * len(participant_names_in_query))
+                        query += f"""
+                            AND m.id IN (
+                                SELECT meeting_id 
+                                FROM participant 
+                                WHERE name IN ({placeholders})
+                            )
+                        """
+                        params.extend(participant_names_in_query)
+                        print(f"[DEBUG] 참가자 필터 추가 (서브쿼리): {participant_names_in_query}")
+                        
                 # 키워드 필터 추가!
                 if list_keywords:
                     keyword_conditions = []
@@ -841,7 +881,20 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                         WHERE p.name = %s
                     """
                     params = [user_name]
-                
+
+                    if participant_names_in_query:
+                        placeholders = ', '.join(['%s'] * len(participant_names_in_query))
+                        query += f"""
+                            AND m.id IN (
+                                SELECT meeting_id 
+                                FROM participant 
+                                WHERE name IN ({placeholders})
+                            )
+                        """
+                        params.extend(participant_names_in_query)
+                        print(f"[DEBUG] 참가자 필터 추가 (날짜 쿼리, 서브쿼리): {participant_names_in_query}")
+                        
+
                 if date_info and date_info.get('start_date'):
                     query += " AND scheduled_at >= %s"
                     params.append(date_info['start_date'])
@@ -2283,7 +2336,7 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
         search_participants("meeting_participants", meeting_id=1)
         search_participants("person_meetings", person_name="김철수")
     """
-    from database import get_db_connection
+    from .database import get_db_connection
     import logging
     
     logger = logging.getLogger(__name__)
