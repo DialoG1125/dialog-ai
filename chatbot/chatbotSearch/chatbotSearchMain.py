@@ -357,25 +357,33 @@ def is_participant_query(user_query: str, context: dict = None) -> dict:
         return {'is_participant': False, 'query_type': None, 'person_name': None}
     
     # ========== 3. 이름 추출 시도 ==========
-    name_patterns = [
-        r'([가-힣]{2,4})[가이]?\s*참석',
-        r'([가-힣]{2,4})[가이]?\s*회의',
-        r'([가-힣]{2,4})랑',
-        r'참석.*?([가-힣]{2,4})[가이]?',
-    ]
-    
-    for pattern in name_patterns:
-        match = re.search(pattern, user_query)
-        if match:
-            person_name = match.group(1)
-            person_name = re.sub(r'[가이은는을를]$', '', person_name)
-            
-            if person_name not in ['사람', '누가', '누구', '회의', '미팅', '멤버', '거기', '여기']:
-                return {
-                    'is_participant': True,
-                    'query_type': 'person_meetings',
-                    'person_name': person_name
-                }
+    # 먼저 의문사 체크 (이름이 없는 경우)
+    interrogatives = ['누가', '누구', '누굴', '누구를', '누가를']
+    has_interrogative = any(word in user_query for word in interrogatives)
+        
+    if not has_interrogative:
+        # 이름이 있을 가능성이 있는 경우만 추출 시도
+        name_patterns = [
+            r'([가-힣]{2,4})[가이]?\s*참석',
+            r'([가-힣]{2,4})[가이]?\s*회의',
+            r'([가-힣]{2,4})랑',
+            r'([가-힣]{2,4})\s*(?:씨|님)',  # 호칭 패턴 추가
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, user_query)
+            if match:
+                person_name = match.group(1)
+                # 조사와 호칭 제거
+                person_name = re.sub(r'[가이은는을를님씨]$', '', person_name)
+                
+                # 불용어 체크 (확장)
+                if person_name not in ['사람', '누가', '누구', '회의', '미팅', '멤버', '거기', '여기', '누님', '그분', '저분', '이분']:
+                    return {
+                        'is_participant': True,
+                        'query_type': 'person_meetings',
+                        'person_name': person_name
+                    }
     
     # ========== 4. 이름 없으면 회의 참석자 조회 ==========
     if context and context.get('selected_meeting_id'):
@@ -2051,10 +2059,10 @@ async def chat(request: ChatRequest):
                 if name_match and any(w in user_query for w in ['참석한', '나온', '있었', '회의']):
                     # 특정 사람이 참석한 회의 검색
                     person_name = name_match.group(1)
-                    # 조사 제거 (가, 이, 은, 는, 을, 를)
-                    person_name = re.sub(r"[가이은는을를]$", "", person_name)
+                    # 조사와 호칭 제거 (가, 이, 은, 는, 을, 를, 님, 씨)
+                    person_name = re.sub(r"[가이은는을를님씨]$", "", person_name)
                     print(f"[DEBUG] Participant 검색 - 특정 사람: {person_name}")
-                    
+
                     from .search import search_participants
                     participant_response, results = search_participants(
                         query_type="person_meetings",

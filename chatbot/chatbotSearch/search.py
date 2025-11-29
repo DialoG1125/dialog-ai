@@ -2245,16 +2245,19 @@ def search_tasks(user_query: str, user_id: int = 1, meeting_id: int = None, user
                     for josa in josas:
                         cleaned_query = cleaned_query.replace(josa, ' ')
                     
-                    # 한글 이름 추출 (2-4글자)
-                    # DB에서 실제 사용자 이름 목록 가져오기
                     cursor.execute("SELECT name FROM user")
                     all_user_names = [row['name'] for row in cursor.fetchall()]
-                    
-                    # 쿼리에서 실제 이름 찾기
+
+                    # 호칭 제거 (님, 씨 등)
+                    cleaned_query = re.sub(r'(님|씨)(?=[^가-힣]|$)', '', user_query)
+
+                    # 쿼리에서 실제 이름 찾기 (가장 긴 이름부터 매칭)
                     found_name = None
-                    for name in all_user_names:
-                        if name in user_query:
+                    all_user_names_sorted = sorted(all_user_names, key=len, reverse=True)
+                    for name in all_user_names_sorted:
+                        if name in cleaned_query:
                             found_name = name
+                            print(f"[DEBUG] 이름 매칭 성공: '{name}' (원본: {user_query})")
                             break
                 
                 if not found_name:
@@ -2395,8 +2398,8 @@ def search_participants(query_type: str, meeting_id: int = None, person_name: st
                 user = cursor.fetchone()
                 
                 if not user:
-                    return (f"{person_name}님을 찾을 수 없어요. 😢", [])
-                
+                    return (f"{person_name}을(를) 찾을 수 없어요. 😢", [])
+
                 # 참석한 회의 목록 조회
                 cursor.execute("""
                     SELECT 
