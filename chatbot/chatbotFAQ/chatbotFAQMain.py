@@ -38,18 +38,6 @@ app.add_middleware(
 )
 
 # ================== 데이터 로드 ==================
-# terms_db = {}
-
-# try:
-#     with open(TERMS_DB_FILE, 'r', encoding='utf-8') as f:
-#         terms_db = json.load(f)
-#     print(f"✅ {len(terms_db)}개 용어 로드 완료")
-# except FileNotFoundError:
-#     print(f"❌ {TERMS_DB_FILE} 파일이 없습니다!")
-# except Exception as e:
-#     print(f"❌ 데이터 로드 실패: {e}")
-
-# ================== 데이터 로드 ==================
 terms_db = {}
 
 def load_terms_database():

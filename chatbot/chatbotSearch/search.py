@@ -765,11 +765,13 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 
                 if user_name:
                     query = """
-                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason,
+                                (SELECT GROUP_CONCAT(DISTINCT p2.name ORDER BY p2.name SEPARATOR ', ')
+                                FROM participant p2
+                                WHERE p2.meeting_id = m.id) as participants
                         FROM meeting m 
                         LEFT JOIN meeting_result mr ON m.id = mr.meeting_id 
-                        INNER JOIN participant p ON m.id = p.meeting_id
-                        WHERE p.name = %s
+                        WHERE m.id IN (SELECT meeting_id FROM participant WHERE name = %s)
                     """
                     params = [user_name]
 
@@ -819,11 +821,11 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 cursor.execute(query, params)
                 meetings = cursor.fetchall()
                 
-                # 참가자 조회 추가
-                for meeting in meetings:
-                    cursor.execute("SELECT name FROM participant WHERE meeting_id = %s", (meeting['id'],))
-                    participants = cursor.fetchall()
-                    meeting['participants'] = [p['name'] for p in participants]
+                # # 참가자 조회 추가
+                # for meeting in meetings:
+                #     cursor.execute("SELECT name FROM participant WHERE meeting_id = %s", (meeting['id'],))
+                #     participants = cursor.fetchall()
+                #     meeting['participants'] = [p['name'] for p in participants]
                 
                 print(f"[DEBUG] 회의 목록 검색 결과: {len(meetings)}개")
                 if meetings:
@@ -874,11 +876,13 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 
                 if user_name:
                     query = """
-                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                        SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason,
+                                (SELECT GROUP_CONCAT(DISTINCT p2.name ORDER BY p2.name SEPARATOR ', ')
+                                FROM participant p2
+                                WHERE p2.meeting_id = m.id) as participants
                         FROM meeting m 
                         LEFT JOIN meeting_result mr ON m.id = mr.meeting_id 
-                        INNER JOIN participant p ON m.id = p.meeting_id
-                        WHERE p.name = %s
+                        WHERE m.id IN (SELECT meeting_id FROM participant WHERE name = %s)
                     """
                     params = [user_name]
 
@@ -1008,16 +1012,17 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
             # 2. SQL 쿼리 구성
             cursor = conn.cursor()
                         
-            query = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
-                FROM meeting m
-                LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
-                INNER JOIN participant p ON m.id = p.meeting_id
-                WHERE 1=1"""
+            query = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason,
+                            (SELECT GROUP_CONCAT(DISTINCT p2.name ORDER BY p2.name SEPARATOR ', ')
+                            FROM participant p2
+                            WHERE p2.meeting_id = m.id) as participants
+                    FROM meeting m
+                    LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
+                    WHERE 1=1"""
             params = []
 
-            # [추가] user_name 조건 (로그인한 사용자가 참석한 회의만)
             if user_name:
-                query += " AND p.name = %s"
+                query += " AND m.id IN (SELECT meeting_id FROM participant WHERE name = %s)"
                 params.append(user_name)
                 print(f"[DEBUG] user_name 필터 추가: {user_name}")
             
@@ -1209,16 +1214,17 @@ def search_meetings_direct(user_query, date_info=None, status=None, user_job=Non
                 # ===== 1단계: status 제거 =====
                 if status:
                     print(f"[DEBUG] 1단계 완화: status 제거")
-                    query_fallback = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason
+                    query_fallback = """SELECT m.*, mr.summary, mr.agenda, mr.purpose, mr.importance_level, mr.importance_reason,
+                        (SELECT GROUP_CONCAT(DISTINCT p2.name ORDER BY p2.name SEPARATOR ', ')
+                        FROM participant p2
+                        WHERE p2.meeting_id = m.id) as participants
                         FROM meeting m
                         LEFT JOIN meeting_result mr ON m.id = mr.meeting_id
-                        INNER JOIN participant p ON m.id = p.meeting_id
                         WHERE 1=1"""
                     params_fallback = []
-                    
-                    # user_name 조건 추가!
+
                     if user_name:
-                        query_fallback += " AND p.name = %s"
+                        query_fallback += " AND m.id IN (SELECT meeting_id FROM participant WHERE name = %s)"
                         params_fallback.append(user_name)
                         print(f"[DEBUG] 1단계 완화: user_name 필터 추가: {user_name}")
                     

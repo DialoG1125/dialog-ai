@@ -8,7 +8,6 @@ import re
 import uuid
 import time
 from datetime import datetime
-from dateutil.relativedelta import relativedelta, MO, TU, WE, TH, FR, SA, SU
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -22,7 +21,6 @@ CLOVA_API_KEY = os.getenv("CLOVA_API_KEY")
 CLOVA_API_URL = os.getenv("CLOVA_STUDIO_URL")
 
 # --- 상수 (JOB_PERSONAS) ---
-# "액션 아이템" 프롬프트는 'general'만 사용하지만, call_hyperclova 함수가 참조하므로 포함합니다.
 JOB_PERSONAS = {
     'PROJECT_MANAGER': '당신은 프로젝트 관리자(PM)입니다. 일정, 리소스, 주요 결정사항을 중요하게 봅니다.',
     'FRONTEND_DEVELOPER': '당신은 프론트엔드 개발자입니다. UI/UX, API 연동, 사용자 인터랙션을 중요하게 봅니다.',
@@ -32,8 +30,7 @@ JOB_PERSONAS = {
     'general': '당신은 회의록 작성 전문가입니다. 회의 내용을 명확하고 간결하게 요약합니다.'
 }
 
-# --- Pydantic DTO (이 서비스와 관련된 모델들) ---
-# 참고: summary_service.py에도 이 DTO들이 중복으로 필요합니다.
+# --- Pydantic DTO ---
 class Transcript(BaseModel):
     speaker: str
     time: str = ""
@@ -58,9 +55,7 @@ class ActionResponse(BaseModel):
     actions: Optional[List[ActionItem]] = None
     error: Optional[str] = None
 
-# --- 공통 헬퍼 함수 (utils) ---
-# 참고: summary_service.py에도 이 함수들이 중복으로 필요합니다.
-
+# --- 공통 헬퍼 함수 ---
 def generate_request_id():
     return f"meeting-{int(time.time() * 1000)}-{uuid.uuid4().hex[:9]}"
 
@@ -73,70 +68,78 @@ def parse_actions(
     actions = []
     lines = actions_text.split('\n')
     
-    # 날짜 파싱 로직을 단순화했습니다 (YYYY-MM-DD만 찾음)
-    date_regex = re.compile(r'\d{4}-\d{2}-\d{2}')
+    # 날짜 추출용 정규식 (대괄호 포함 여부 상관없이 YYYY-MM-DD 추출)
+    date_regex = re.compile(r'(\d{4}-\d{2}-\d{2})')
+    # 담당자 추출용 정규식 (소괄호 안의 내용 추출)
+    assignee_regex = re.compile(r'\(([^)]+)\)')
 
     for line in lines:
         trimmed = line.strip()
-        # 리스트 형태가 아니면 스킵
+        # 리스트 마커 제거 (- 또는 숫자.)
         if not (trimmed.startswith('-') or trimmed.startswith('•') or re.match(r'^\d+\.', trimmed)):
             continue
-
+        
+        # 순수 텍스트만 남기기 위해 마커 제거
         text = re.sub(r'^[-•\d.)\s]+', '', trimmed).strip()
 
         assignee = ''
         raw_assignee = ''
         deadline = ''
 
-        # 1. 담당자 파싱
-        assignee_match = re.search(r'\(([^)]+)\)', text)
-        if assignee_match:
-            potential_assignee = assignee_match.group(1).strip()
-            # 시간 형식(12시 30분)이 담당자로 오인되는 것 방지
-            if not re.match(r'(오전|오후)?\s*\d{1,2}시', potential_assignee):
-                if potential_assignee in ('팀 담당', '담당자 미지정'):
-                    raw_assignee = potential_assignee
-                else:
-                    raw_assignee = re.sub(r'\s*담당$', '', potential_assignee).strip()
-                text = text.replace(assignee_match.group(0), '').strip()
+        # 1. 날짜 파싱 및 제목에서 제거 (가장 먼저 수행)
+        date_match = date_regex.search(text)
+        if date_match:
+            deadline = date_match.group(1)
+            # 날짜 패턴을 포함한 대괄호/괄호까지 찾아서 지우기
+            text = re.sub(r'\[\s*' + deadline + r'\s*.*?\]', '', text)
+            text = re.sub(r'\(\s*' + deadline + r'\s*.*?\)', '', text)
+            # 괄호 없이 날짜만 있어도 제거
+            text = text.replace(deadline, '')
 
+        # 2. 담당자 파싱 및 제목에서 제거
+        assignee_matches = list(assignee_regex.finditer(text))
+        for match in assignee_matches:
+            content = match.group(1).strip()
+            
+            # "10시", "오후 2시" 같은 시간 표현은 담당자가 아님 -> 건너뜀
+            if re.match(r'.*\d시.*', content):
+                continue
+            
+            # 담당자 후보 확인
+            if content in ('팀 담당', '담당자 미지정'):
+                raw_assignee = content
+            else:
+                raw_assignee = re.sub(r'\s*담당$', '', content).strip()
+            
+            # 제목에서 해당 부분 "(홍길동)" 제거
+            text = text.replace(match.group(0), '')
+            break # 첫 번째 매칭된 사람을 담당자로 간주
+
+        # 담당자 이름 매핑
         if raw_assignee and speaker_mapping:
             assignee = speaker_mapping.get(raw_assignee, raw_assignee)
         elif raw_assignee: 
             assignee = raw_assignee
+        else:
+            assignee = "담당자 미지정"
 
-        # 2. 날짜 파싱 (AI가 계산해준 YYYY-MM-DD 추출)
-        # 복잡한 한글 날짜 처리 로직 제거 -> 정규식으로 YYYY-MM-DD만 쏙 뽑아냄
-        bracket_matches = list(re.finditer(r'\[([^\]]+)\]', text))
-        
-        for match in bracket_matches:
-            content = match.group(1).strip()
-            # 내용이 날짜 형식이면 deadline으로 설정
-            if date_regex.fullmatch(content):
-                deadline = content
-                text = text.replace(match.group(0), '', 1).strip()
-                break
-            # 내용이 팀명인 경우(예: [백엔드팀])는 그대로 둠
+        # 3. 텍스트 최종 정리 (남은 괄호, 특수문자 정리)
+        text = re.sub(r'\[\s*\]', '', text) # 빈 대괄호 제거
+        text = re.sub(r'\(\s*\)', '', text) # 빈 소괄호 제거
+        text = re.sub(r'[.,;]$', '', text)  # 끝 문장부호 제거
+        text = re.sub(r'\s+', ' ', text).strip() # 다중 공백 정리
 
-        # 날짜 파싱 후 빈 대괄호 제거
-        text = re.sub(r'\[\s*\]', '', text).strip()
-
-        # 3. 텍스트 후처리
-        text = re.sub(r'[.,;]$', '', text).strip()
-        text = re.sub(r'\s+', ' ', text).strip()
-
-        if "할 일 없음" in text or "없습니다" in text:
+        if "할 일 없음" in text or "없습니다" in text or not text:
             continue
 
-        if text:
-            item = ActionItem(
-                title=text,
-                assignee=assignee,
-                deadline=deadline,
-                addedToCalendar=False,
-                source=source
-            )
-            actions.append(item)
+        item = ActionItem(
+            title=text,
+            assignee=assignee,
+            deadline=deadline,
+            addedToCalendar=False,
+            source=source
+        )
+        actions.append(item)
 
     return actions
 
@@ -152,65 +155,34 @@ async def call_hyperclova(
 ) -> str:
 
     persona_general = JOB_PERSONAS['general']
-    persona_user = JOB_PERSONAS.get(user_job, persona_general)
-
-    # 직무별 팀 키워드 정리
-    team_keywords = []
-    if user_job == 'BACKEND_DEVELOPER':
-        team_keywords = ['백엔드 개발팀', '백엔드팀', '개발팀', '서버팀'] 
-    elif user_job == 'FRONTEND_DEVELOPER':
-        team_keywords = ['프론트엔드 개발팀', '프론트엔드팀', 'UI/UX팀']
-    elif user_job == 'DATABASE_ADMINISTRATOR':
-        team_keywords = ['DBA팀', 'DB팀']
-    elif user_job == 'SECURITY_DEVELOPER':
-        team_keywords = ['보안팀', '정보보안팀']
-    elif user_job == 'PROJECT_MANAGER':
-        team_keywords = ['PM', '기획팀']
-
-    team_keyword_string = ""
-    if team_keywords:
-        team_keyword_string = f"'{', '.join(team_keywords)}'과(와) 같은"
-
+    
     participants_str = ", ".join(participants) if participants else "정보 없음"
 
+    # 프롬프트 설정 (포맷 강제)
     prompts = {
-        '액션아이템': f"당신은 [{persona_user}]의 관점에서 회의록을 작성하는 비서입니다.\n"
-                    f"당신의 이름(사용자)은 '{user_name}'입니다.\n"
-                    f"현재 회의 참가자 명단: [{participants_str}]\n\n"
-                    
-                    f"### [매우 중요] 날짜 계산 기준\n"
-                    f"**이 회의가 열린 날짜는 '{meeting_date}' 입니다.** (오늘이 아닙니다)\n"
-                    f"대화에 나오는 모든 상대적 시간 표현(내일, 모레, 다음주 금요일 등)은 **반드시 위 날짜를 기준으로 계산**하세요.\n"
-                    f"계산된 날짜는 **'YYYY-MM-DD' 형식으로 변환**하여 대괄호 안에 적어야 합니다.\n"
-                    f"예시: 회의 날짜가 2025-11-02일 때 '내일' -> [2025-11-03]\n\n"
-                    
-                    f"## 작업 지침\n"
-                    f"회의 대화를 분석하여 **명확하게 합의된 '내 할 일(To-Do)'만** 추출하세요.\n"
-                    f"할 일이 전혀 발견되지 않으면 반드시 '할 일 없음'이라고만 출력하세요.\n\n"
-                    
-                    f"1. **유형 1 (본인)**: '{user_name}'(당신)이 수행할 작업.\n"
-                    f"2. **유형 2 (지시)**: 타인이 '{user_name}'에게 요청한 작업.\n"
-                    f"3. **유형 3 (팀)**: '{user_name}'이 속한 팀({team_keyword_string}) 전체의 작업.\n\n"
-                    
-                    f"## 필수 포맷 규칙\n"
-                    f"- **팀 업무(유형 3)**인 경우: 맨 앞에 `[팀명]`을 붙이세요.\n"
-                    f"- 형식: `- [팀명(선택)] 작업 내용 (담당자) [YYYY-MM-DD]`\n"
-                    f"- 날짜가 언급되지 않았다면 대괄호 `[]` 자체를 쓰지 마세요.\n\n"
-                    
-                    f"## 작성 예시\n"
-                    f"(Good) - [백엔드팀] API 명세서 작성 (담당자 미지정) [2025-11-28]\n"
-                    f"(Good) - 클라우드 비용 보고서 제출 ({user_name}) [2025-12-05]\n"
-                    f"(Good) - 할 일 없음\n\n"
-                    
-                    f"## 회의 대화\n{conversation_text}\n\n"
-                    f"'{user_name}'님의 할 일 목록:"
+        '액션아이템': (
+            f"당신은 회의록 작성 AI입니다.\n"
+            f"회의 날짜: {meeting_date}\n"
+            f"참석자: {participants_str}\n\n"
+            f"**지시사항:**\n"
+            f"1. 회의 내용을 분석하여 '구체적인 할 일(Action Item)'을 추출하세요.\n"
+            f"2. 모든 날짜 표현(내일, 다음주 등)은 회의 날짜({meeting_date})를 기준으로 `YYYY-MM-DD` 포맷으로 변환하세요.\n"
+            f"3. 담당자가 명확하지 않으면 '담당자 미지정'이라고 적으세요.\n"
+            f"4. **반드시 아래 포맷을 정확히 지키세요.** 다른 말은 하지 마세요.\n\n"
+            f"**필수 출력 포맷:**\n"
+            f"- 할 일 내용 (담당자이름) [YYYY-MM-DD]\n"
+            f"- 할 일 내용 (담당자이름) [YYYY-MM-DD]\n\n"
+            f"**예시:**\n"
+            f"- API 명세서 작성 (김철수) [2025-11-30]\n"
+            f"- [백엔드팀] DB 스키마 설계 (박영희) [2025-12-01]\n"
+            f"- 회식 장소 예약 (담당자 미지정) [2025-12-05]\n\n"
+            f"**회의 대화:**\n{conversation_text}\n\n"
+            f"**결과:**"
+        )
     }
 
     if task_type not in prompts:
         raise ValueError(f"지원하지 않는 task_type입니다: {task_type}")
-
-    system_content = persona_user
-    current_max_tokens = 800
 
     headers = {
         'Authorization': f'Bearer {CLOVA_API_KEY}',
@@ -220,15 +192,14 @@ async def call_hyperclova(
 
     body = {
         "messages": [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": persona_general},
             {"role": "user", "content": prompts[task_type]}
         ],
         "topP": 0.8,
         "topK": 0,
-        "maxTokens": current_max_tokens,
-        "temperature": 0.3,
+        "maxTokens": 800,
+        "temperature": 0.1,
         "repeatPenalty": 5.0,
-        "stopBefore": [],
         "includeAiFilters": True
     }
 
@@ -236,10 +207,7 @@ async def call_hyperclova(
         response = await client.post(CLOVA_API_URL, headers=headers, json=body, timeout=30.0)
         response.raise_for_status() 
         data = response.json()
-
-        if data.get("status") and data["status"].get("code") != "20000":
-            raise HTTPException(status_code=500, detail=f"HyperCLOVA API 오류: {data['status'].get('message')}")
-
+        
         result_text = data.get("result", {}).get("message", {}).get("content", "") or \
                       data.get("result", {}).get("text", "") 
         
@@ -248,41 +216,22 @@ async def call_hyperclova(
 
         return result_text.strip()
 
-    except httpx.HTTPStatusError as e:
-        print(f"HyperCLOVA API 호출 오류: {e}")
-        raise HTTPException(status_code=e.response.status_code, detail=f"HyperCLOVA API 오류: {e.response.text}")
     except Exception as e:
-        print(f"API 호출 중 알 수 없는 오류: {e}")
-        raise HTTPException(status_code=500, detail=f"API 호출 중 알 수 없는 오류: {e}")
+        print(f"HyperCLOVA API 오류: {e}")
+        raise HTTPException(status_code=500, detail=f"API 오류: {str(e)}")
 
-
-# --- "내 할 일 생성" 비즈니스 로직 ---
-# main.py가 이 함수를 호출합니다.
+# --- 내 할 일 생성 로직 ---
 async def generate_all_actions_service(request: ActionRequest) -> List[ActionItem]:
     user_name = request.currentUserName
-    user_job = request.userJob
-
-    if not user_name:
-        return []
-
+    
     participants_list = list(set(request.speakerMapping.values()))
-
     conversation_lines = []
     for t in request.transcripts:
         display_name = request.speakerMapping.get(t.speaker, t.speaker)
-        if display_name == user_name:
-            speaker_display = user_name
-        else:
-            speaker_display = display_name
-        conversation_lines.append(f"{speaker_display} ({t.time}): {t.text}")
-
+        conversation_lines.append(f"{display_name} ({t.time}): {t.text}")
     conversation_text = "\n".join(conversation_lines)
 
-    target_date = request.meetingDate
-    if "T" in target_date:
-        target_date = target_date.split("T")[0]
-
-    print(f"[{user_name}] 액션 아이템 생성 요청 (참가자: {participants_list}, 기준일: {target_date})")
+    target_date = request.meetingDate.split("T")[0]
 
     async with httpx.AsyncClient() as client:
         try:
@@ -290,7 +239,7 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
                 client, 
                 conversation_text, 
                 '액션아이템', 
-                user_job, 
+                'general', 
                 user_name, 
                 participants_list, 
                 target_date 
@@ -299,44 +248,11 @@ async def generate_all_actions_service(request: ActionRequest) -> List[ActionIte
             if not actions_text or "할 일 없음" in actions_text:
                 return []
 
-            all_actions = parse_actions(
+            final_actions = parse_actions(
                 actions_text, 
                 request.speakerMapping, 
                 source='ai' 
             )
-            
-            final_actions = []
-            for action in all_actions:
-                assignee = action.assignee
-                
-                has_team_tag = re.match(r'^\[.*(?:팀|부서|파트).*\]', action.title)
-                starts_with_team = re.match(r'^\s*\S+(?:팀|부서|파트)', action.title)
-                has_group_keyword = (
-                    "팀 전체" in action.title 
-                    or "부서 전체" in action.title 
-                    or "팀원들" in action.title 
-                    or "팀 내" in action.title
-                    or "백엔드팀" in action.title
-                    or "프론트엔드팀" in action.title
-                    or "개발팀" in action.title
-                )
-
-                if has_team_tag or starts_with_team or has_group_keyword:
-                    action.assignee = "담당자 미지정"
-                    if not has_team_tag:
-                        action.title = f"[팀 업무] {action.title}"
-                    final_actions.append(action)
-
-                elif assignee in participants_list:
-                    final_actions.append(action)
-                
-                elif assignee in ['담당자 미지정', '미지정', '']:
-                    action.assignee = "담당자 미지정" 
-                    final_actions.append(action)
-
-                else:
-                    action.assignee = "담당자 미지정" 
-                    final_actions.append(action)
 
             return final_actions
 

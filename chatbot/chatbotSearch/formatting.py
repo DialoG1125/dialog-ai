@@ -41,7 +41,7 @@ def format_single_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
@@ -292,7 +292,7 @@ def format_project_manager_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
@@ -339,7 +339,7 @@ def format_frontend_developer_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
@@ -385,7 +385,7 @@ def format_backend_developer_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
@@ -428,7 +428,7 @@ def format_database_administrator_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
@@ -472,7 +472,7 @@ def format_security_developer_meeting(meeting: dict) -> str:
     
     # 추가 정보 추출
     participants = meeting.get('participants', [])
-    participants_str = ', '.join(participants) if participants else '정보 없음'
+    participants_str = participants if participants else '정보 없음'
     purpose = meeting.get('purpose') or '정보 없음'
     agenda = meeting.get('agenda') or '정보 없음'
     importance_str = format_importance(meeting.get('importance_level'), meeting.get('importance_reason'))
